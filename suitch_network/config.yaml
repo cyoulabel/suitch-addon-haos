@@ -1,6 +1,6 @@
 name: "Suitch Network"
 description: "Integración con suitch.network — publica sensores vía HA REST API"
-version: "1.2.0"
+version: "1.2.1"
 slug: "suitch_network"
 init: false
 arch:
