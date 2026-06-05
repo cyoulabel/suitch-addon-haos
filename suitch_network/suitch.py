@@ -51,8 +51,7 @@ def load_saved_token() -> str:
     if os.path.exists(TOKEN_FILE):
         with open(TOKEN_FILE, encoding="utf-8") as f:
             t = f.read().strip()
-            if t:
-                return t
+            if t: return t
     return ""
 
 
@@ -100,82 +99,93 @@ class SuitchClient:
             raw = gzip.decompress(raw)
         return raw
 
-    def _try_login(self, payload: bytes, content_type: str, label: str) -> bool:
-        req = urllib.request.Request(
-            f"{BASE_URL}/auth/v2/login.json",
-            data=payload,
-            method="POST",
-            headers={
-                "User-Agent":   UA,
-                "Content-Type": content_type,
-                "Accept":       "application/json",
-            },
-        )
+    def _post(self, url, payload, content_type, label) -> dict | None:
+        req = urllib.request.Request(url, data=payload, method="POST",
+            headers={"User-Agent": UA, "Content-Type": content_type, "Accept": "application/json"})
         try:
             with self._opener.open(req, timeout=15) as r:
                 body = self._read(r)
-                log.info("[%s] Login OK (%s): %s", label, r.status, body[:500])
-                resp = json.loads(body)
-                new_token = (
-                    resp.get("id_token") or resp.get("token") or
-                    resp.get("authenticity_token") or resp.get("jwt") or
-                    resp.get("access_token")
-                )
-                if new_token:
-                    self._token = new_token
-                    save_token(new_token)
-                    log.info("Nuevo token guardado: %s...", new_token[:20])
-                else:
-                    log.info("Login OK sin nuevo token — respuesta: %s", resp)
-                return True
+                log.info("[%s] → %s: %s", label, r.status, body[:400])
+                return json.loads(body)
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")
             log.warning("[%s] → %s: %s", label, e.code, body)
-            return False
+            return None
 
     def login(self) -> None:
         self._opener = self._new_opener()
+        found = False
 
-        if not self._token:
-            raise RuntimeError(
-                "No hay id_token.\n"
-                "Abre Chrome → F12 → Application → Local Storage → suitch.network\n"
-                "Copia 'id_token' y pégalo en Configuration del addon."
+        # ── Intento A: webLogin.json sin _token (puede funcionar sin él) ──
+        log.info("Intento A: webLogin.json sin token")
+        r = self._post(
+            f"{BASE_URL}/auth/webLogin.json",
+            urllib.parse.urlencode({"email": self._email, "password": self._password}).encode(),
+            "application/x-www-form-urlencoded", "webLogin-notoken"
+        )
+        if r is not None and "error" not in str(r).lower():
+            found = True; self._extract_token(r)
+
+        # ── Intento B: webLogin.json con id_token como _token ──
+        if not found and self._token:
+            log.info("Intento B: webLogin.json con _token")
+            r = self._post(
+                f"{BASE_URL}/auth/webLogin.json",
+                urllib.parse.urlencode({"email": self._email, "password": self._password, "_token": self._token}).encode(),
+                "application/x-www-form-urlencoded", "webLogin-token"
             )
+            if r is not None and "error" not in str(r).lower():
+                found = True; self._extract_token(r)
 
-        log.info("Login con token: %s... (%d chars)", self._token[:20], len(self._token))
+        # ── Intento C: auth/v2/login.json JSON con id_token ──
+        if not found and self._token:
+            log.info("Intento C: v2/login.json JSON con id_token")
+            r = self._post(
+                f"{BASE_URL}/auth/v2/login.json",
+                json.dumps({"email": self._email, "password": self._password,
+                            "authenticity_token": self._token, "utf8": "✓"}).encode(),
+                "application/json", "v2-json"
+            )
+            if r is not None and "error" not in str(r).lower():
+                found = True; self._extract_token(r)
 
-        # Intento 1: JSON (como envía axios en el app.js)
-        payload_json = json.dumps({
-            "email":              self._email,
-            "password":           self._password,
-            "authenticity_token": self._token,
-            "utf8":               "✓",
-        }).encode("utf-8")
+        # ── Intento D: auth/v2/login.json form-encoded con id_token ──
+        if not found and self._token:
+            log.info("Intento D: v2/login.json form con id_token")
+            r = self._post(
+                f"{BASE_URL}/auth/v2/login.json",
+                urllib.parse.urlencode({"email": self._email, "password": self._password,
+                                        "authenticity_token": self._token, "utf8": "✓"}).encode(),
+                "application/x-www-form-urlencoded", "v2-form"
+            )
+            if r is not None and "error" not in str(r).lower():
+                found = True; self._extract_token(r)
 
-        if self._try_login(payload_json, "application/json", "JSON"):
-            return
+        if not found:
+            raise RuntimeError(
+                "Todos los intentos de login fallaron.\n"
+                "Abre Chrome DevTools → F12 → Network, haz login y pégame\n"
+                "el request completo (headers + payload) de auth/v2/login.json"
+            )
+        log.info("Login exitoso")
 
-        # Intento 2: form-encoded
-        payload_form = urllib.parse.urlencode({
-            "email":              self._email,
-            "password":           self._password,
-            "authenticity_token": self._token,
-            "utf8":               "✓",
-        }).encode("utf-8")
-
-        if self._try_login(payload_form, "application/x-www-form-urlencoded", "FORM"):
-            return
-
-        raise RuntimeError("Login fallido en ambos formatos. Revisa el log.")
+    def _extract_token(self, resp: dict) -> None:
+        new_token = (
+            resp.get("id_token") or resp.get("token") or
+            resp.get("authenticity_token") or resp.get("jwt") or
+            resp.get("access_token")
+        )
+        if new_token:
+            self._token = new_token
+            save_token(new_token)
+            log.info("Nuevo token guardado: %s...", new_token[:20])
 
     def devices(self) -> list[dict]:
         req = urllib.request.Request(
             f"{BASE_URL}/devices/v2/show.json",
             headers={
-                "User-Agent":    UA,
-                "Accept":        "application/json",
-                "Authorization": f"Bearer {self._token}" if self._token else "",
+                "User-Agent": UA, "Accept": "application/json",
+                **({"Authorization": f"Bearer {self._token}"} if self._token else {}),
             },
         )
         with self._opener.open(req, timeout=15) as r:
@@ -198,8 +208,7 @@ def publish_device(dev: dict) -> None:
     slug = name.lower().replace(" ", "_")
     numeric_found = False
     for field, value in dev.items():
-        if not isinstance(value, (int, float)):
-            continue
+        if not isinstance(value, (int, float)): continue
         numeric_found = True
         entity_id = f"sensor.suitch_{slug}_{field.lower()}"
         unit, dev_class = _unit_and_class(field)
