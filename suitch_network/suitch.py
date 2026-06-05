@@ -2,11 +2,6 @@
 """
 Suitch Network — Home Assistant Add-on
 Sin dependencias externas (stdlib pura).
-
-MECANISMO DE AUTENTICACIÓN:
-  El app.js usa localStorage.getItem("id_token") como authenticity_token.
-  Para bootstrap, el usuario pega su id_token del browser en la config.
-  Tras el primer login, el token se renueva automáticamente desde /data/id_token.txt
 """
 
 import json
@@ -16,6 +11,7 @@ import ssl
 import time
 import urllib.request
 import urllib.parse
+import urllib.error
 import http.cookiejar
 from typing import Any
 
@@ -26,8 +22,8 @@ logging.basicConfig(
 )
 log = logging.getLogger("suitch")
 
-BASE_URL    = "https://suitch.network"
-TOKEN_FILE  = "/data/id_token.txt"
+BASE_URL   = "https://suitch.network"
+TOKEN_FILE = "/data/id_token.txt"
 
 SSL_CTX = ssl.create_default_context()
 SSL_CTX.check_hostname = False
@@ -35,10 +31,6 @@ SSL_CTX.verify_mode    = ssl.CERT_NONE
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
-
-# ─────────────────────────────────────────────────────────────
-#  Configuración
-# ─────────────────────────────────────────────────────────────
 
 def load_config() -> dict:
     with open("/data/options.json", encoding="utf-8") as f:
@@ -56,26 +48,18 @@ def load_config() -> dict:
 
 
 def load_saved_token() -> str:
-    """Lee el id_token persistido en /data/id_token.txt."""
     if os.path.exists(TOKEN_FILE):
         with open(TOKEN_FILE, encoding="utf-8") as f:
             t = f.read().strip()
             if t:
-                log.info("Token cargado desde %s", TOKEN_FILE)
                 return t
     return ""
 
 
 def save_token(token: str) -> None:
-    """Guarda el id_token en /data/id_token.txt para futuras sesiones."""
     with open(TOKEN_FILE, "w", encoding="utf-8") as f:
         f.write(token)
-    log.info("Token guardado en %s", TOKEN_FILE)
 
-
-# ─────────────────────────────────────────────────────────────
-#  HA Supervisor API
-# ─────────────────────────────────────────────────────────────
 
 HA_API   = "http://supervisor/core/api"
 HA_TOKEN = os.environ.get("SUPERVISOR_TOKEN", "")
@@ -95,15 +79,11 @@ def ha_set_state(entity_id: str, state: Any, attributes: dict = {}) -> bool:
         return False
 
 
-# ─────────────────────────────────────────────────────────────
-#  Cliente suitch.network
-# ─────────────────────────────────────────────────────────────
-
 class SuitchClient:
     def __init__(self, email: str, password: str, initial_token: str = ""):
         self._email    = email
         self._password = password
-        self._token    = initial_token   # id_token actual (se renueva tras cada login)
+        self._token    = initial_token
         self._opener   = self._new_opener()
 
     def _new_opener(self):
@@ -120,59 +100,74 @@ class SuitchClient:
             raw = gzip.decompress(raw)
         return raw
 
-    def login(self) -> None:
-        self._opener = self._new_opener()
-
-        if not self._token:
-            raise RuntimeError(
-                "No hay id_token disponible.\n"
-                "Para el primer login:\n"
-                "  1. Abre Chrome → DevTools (F12) → Application\n"
-                "  2. Storage → Local Storage → https://suitch.network\n"
-                "  3. Copia el valor de 'id_token'\n"
-                "  4. Pégalo en Configuration → id_token del addon"
-            )
-
-        log.info("Haciendo login con id_token: %s...", self._token[:20])
-
-        payload = json.dumps({
-            "email":              self._email,
-            "password":           self._password,
-            "authenticity_token": self._token,
-            "utf8":               "✓",
-        }).encode("utf-8")
-
+    def _try_login(self, payload: bytes, content_type: str, label: str) -> bool:
         req = urllib.request.Request(
             f"{BASE_URL}/auth/v2/login.json",
             data=payload,
             method="POST",
             headers={
                 "User-Agent":   UA,
-                "Content-Type": "application/json",
+                "Content-Type": content_type,
                 "Accept":       "application/json",
             },
         )
-        with self._opener.open(req, timeout=15) as r:
-            body = self._read(r)
-            log.info("Login response (%s): %s", r.status, body[:500])
-            resp = json.loads(body)
+        try:
+            with self._opener.open(req, timeout=15) as r:
+                body = self._read(r)
+                log.info("[%s] Login OK (%s): %s", label, r.status, body[:500])
+                resp = json.loads(body)
+                new_token = (
+                    resp.get("id_token") or resp.get("token") or
+                    resp.get("authenticity_token") or resp.get("jwt") or
+                    resp.get("access_token")
+                )
+                if new_token:
+                    self._token = new_token
+                    save_token(new_token)
+                    log.info("Nuevo token guardado: %s...", new_token[:20])
+                else:
+                    log.info("Login OK sin nuevo token — respuesta: %s", resp)
+                return True
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            log.warning("[%s] → %s: %s", label, e.code, body)
+            return False
 
-        # Guardar el nuevo token que devuelve el servidor
-        new_token = (
-            resp.get("id_token") or
-            resp.get("token") or
-            resp.get("authenticity_token") or
-            resp.get("jwt") or
-            resp.get("access_token")
-        )
-        if new_token:
-            self._token = new_token
-            save_token(new_token)
-            log.info("Nuevo id_token guardado: %s...", new_token[:20])
-        else:
-            log.info("Login OK — respuesta completa: %s", resp)
+    def login(self) -> None:
+        self._opener = self._new_opener()
 
-        log.info("Login exitoso")
+        if not self._token:
+            raise RuntimeError(
+                "No hay id_token.\n"
+                "Abre Chrome → F12 → Application → Local Storage → suitch.network\n"
+                "Copia 'id_token' y pégalo en Configuration del addon."
+            )
+
+        log.info("Login con token: %s... (%d chars)", self._token[:20], len(self._token))
+
+        # Intento 1: JSON (como envía axios en el app.js)
+        payload_json = json.dumps({
+            "email":              self._email,
+            "password":           self._password,
+            "authenticity_token": self._token,
+            "utf8":               "✓",
+        }).encode("utf-8")
+
+        if self._try_login(payload_json, "application/json", "JSON"):
+            return
+
+        # Intento 2: form-encoded
+        payload_form = urllib.parse.urlencode({
+            "email":              self._email,
+            "password":           self._password,
+            "authenticity_token": self._token,
+            "utf8":               "✓",
+        }).encode("utf-8")
+
+        if self._try_login(payload_form, "application/x-www-form-urlencoded", "FORM"):
+            return
+
+        raise RuntimeError("Login fallido en ambos formatos. Revisa el log.")
 
     def devices(self) -> list[dict]:
         req = urllib.request.Request(
@@ -187,10 +182,6 @@ class SuitchClient:
             data = json.loads(self._read(r))
         return data if isinstance(data, list) else data.get("devices", [])
 
-
-# ─────────────────────────────────────────────────────────────
-#  Publicar dispositivos en HA
-# ─────────────────────────────────────────────────────────────
 
 def _unit_and_class(field: str):
     f = field.lower()
@@ -222,17 +213,11 @@ def publish_device(dev: dict) -> None:
                      {"friendly_name": f"Suitch {name}", "device_uid": uid, "raw": dev})
 
 
-# ─────────────────────────────────────────────────────────────
-#  Main
-# ─────────────────────────────────────────────────────────────
-
 def main() -> None:
-    cfg = load_config()
-
-    # Prioridad de token: config → archivo guardado
+    cfg   = load_config()
     token = cfg["id_token"] or load_saved_token()
-    if token:
-        save_token(token)   # normalizar siempre a archivo
+    if token and cfg["id_token"]:
+        save_token(token)
 
     client   = SuitchClient(cfg["email"], cfg["password"], token)
     interval = cfg["scan_interval"]
