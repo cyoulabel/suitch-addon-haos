@@ -2,16 +2,12 @@
 """
 Suitch Network — Home Assistant Add-on
 Sin dependencias externas (stdlib pura).
-
-Flujo de comunicación:
-  [Este addon]  →  suitch.network  (HTTPS externo, puerto 443)
-  [Este addon]  →  HA Supervisor   (HTTP interno, http://supervisor/core/api)
-                   ↑ sin puerto expuesto, comunicación dentro de la red de Docker de HA
 """
 
 import json
 import logging
 import os
+import ssl
 import time
 import urllib.request
 import urllib.parse
@@ -28,17 +24,22 @@ log = logging.getLogger("suitch")
 
 BASE_URL = "https://suitch.network"
 
+# SSL context — deshabilita verificación si el cert de suitch.network está vencido
+SSL_CTX = ssl.create_default_context()
+SSL_CTX.check_hostname = False
+SSL_CTX.verify_mode    = ssl.CERT_NONE
+
+
 # ─────────────────────────────────────────────────────────────
-#  Credenciales — vienen de la UI del addon (/data/options.json)
-#  HA Supervisor escribe ese archivo antes de arrancar el addon
+#  Credenciales desde /data/options.json (UI del addon)
 # ─────────────────────────────────────────────────────────────
 
 def load_config() -> dict:
     options_file = "/data/options.json"
     if not os.path.exists(options_file):
         raise FileNotFoundError(
-            "No se encontró /data/options.json\n"
-            "Configura email y password en la pestaña 'Configuration' del addon."
+            "No se encontró /data/options.json — "
+            "configura email y password en la pestaña 'Configuration' del addon."
         )
     with open(options_file, encoding="utf-8") as f:
         opts = json.load(f)
@@ -47,9 +48,7 @@ def load_config() -> dict:
     password = opts.get("password", "").strip()
 
     if not email or not password:
-        raise ValueError(
-            "Email o password vacíos — revisa la pestaña 'Configuration' del addon."
-        )
+        raise ValueError("Email o password vacíos — revisa la pestaña 'Configuration'.")
 
     return {
         "email":         email,
@@ -59,10 +58,7 @@ def load_config() -> dict:
 
 
 # ─────────────────────────────────────────────────────────────
-#  HA Supervisor API
-#  URL interna:  http://supervisor/core/api
-#  Token:        SUPERVISOR_TOKEN  (inyectado automáticamente por HA)
-#  Puerto:       ninguno expuesto — es red Docker interna
+#  HA Supervisor API  (red Docker interna, sin puerto externo)
 # ─────────────────────────────────────────────────────────────
 
 HA_API   = "http://supervisor/core/api"
@@ -112,7 +108,11 @@ class SuitchClient:
 
     def _new_opener(self):
         jar = http.cookiejar.CookieJar()
-        return urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+        https_handler = urllib.request.HTTPSHandler(context=SSL_CTX)
+        return urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(jar),
+            https_handler,
+        )
 
     def _get(self, url: str, accept="application/json") -> bytes:
         req = urllib.request.Request(url, headers={
@@ -209,7 +209,7 @@ def publish_device(dev: dict) -> None:
 # ─────────────────────────────────────────────────────────────
 
 def main() -> None:
-    cfg = load_config()
+    cfg      = load_config()
     client   = SuitchClient(cfg["email"], cfg["password"])
     interval = cfg["scan_interval"]
 
