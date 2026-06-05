@@ -28,10 +28,20 @@ SSL_CTX = ssl.create_default_context()
 SSL_CTX.check_hostname = False
 SSL_CTX.verify_mode    = ssl.CERT_NONE
 
+# Headers completos que imitan Chrome — necesarios para pasar Cloudflare/WAF
 BROWSER_HEADERS = {
-    "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept-Language": "es-MX,es;q=0.9,en;q=0.8",
-    "Connection":      "keep-alive",
+    "User-Agent":                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept-Language":           "es-MX,es;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Encoding":           "gzip, deflate, br",
+    "Connection":                "keep-alive",
+    "Sec-Ch-Ua":                 '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "Sec-Ch-Ua-Mobile":          "?0",
+    "Sec-Ch-Ua-Platform":        '"Windows"',
+    "Sec-Fetch-Site":            "none",
+    "Sec-Fetch-Mode":            "navigate",
+    "Sec-Fetch-User":            "?1",
+    "Sec-Fetch-Dest":            "document",
+    "Upgrade-Insecure-Requests": "1",
 }
 
 
@@ -120,63 +130,84 @@ class SuitchClient:
             raw = gzip.decompress(raw)
         return raw
 
-    def _get_csrf(self) -> str | None:
+    def _get_csrf(self) -> str:
         """
-        Intenta obtener el CSRF token desde la raíz del sitio.
-        Si falla con 403, regresa None y el login procede sin él.
+        Obtiene el CSRF token probando varias URLs públicas del sitio.
+        Lanza RuntimeError si no lo encuentra en ninguna.
         """
-        for url in [f"{BASE_URL}/", f"{BASE_URL}/login"]:
+        candidates = [
+            f"{BASE_URL}/users/sign_in",
+            f"{BASE_URL}/",
+            f"{BASE_URL}/login",
+        ]
+        for url in candidates:
             try:
                 req = urllib.request.Request(url, headers={
                     **BROWSER_HEADERS,
-                    "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
                 })
                 with self._opener.open(req, timeout=15) as r:
+                    log.info("GET %s → %s", url, r.status)
                     raw = self._read(r)
                 p = _CSRFParser()
                 p.feed(raw.decode("utf-8", errors="replace"))
                 if p.token:
                     log.info("CSRF token obtenido desde %s", url)
                     return p.token
+                else:
+                    log.warning("GET %s OK pero sin CSRF token en el HTML", url)
             except Exception as e:
-                log.debug("CSRF fetch fallido en %s: %s", url, e)
-        log.warning("No se obtuvo CSRF token — intentando login sin él")
-        return None
+                log.warning("GET %s → %s", url, e)
+
+        raise RuntimeError(
+            "No se pudo obtener el CSRF token desde ninguna URL. "
+            "Verifica que suitch.network sea accesible desde el addon."
+        )
 
     def login(self) -> None:
         self._opener = self._new_opener()
         token = self._get_csrf()
 
-        # Intentar login con JSON body (no requiere CSRF en Rails API)
-        payload = json.dumps({
-            "email":    self._email,
-            "password": self._password,
+        # Form-encoded igual que el browser
+        payload = urllib.parse.urlencode({
+            "email":              self._email,
+            "password":           self._password,
+            "authenticity_token": token,
+            "utf8":               "✓",
         }).encode("utf-8")
-
-        headers = {
-            **BROWSER_HEADERS,
-            "Content-Type":     "application/json",
-            "Accept":           "application/json",
-            "X-Requested-With": "XMLHttpRequest",
-        }
-        if token:
-            headers["X-CSRF-Token"] = token
 
         req = urllib.request.Request(
             f"{BASE_URL}/auth/v2/login.json",
             data=payload,
             method="POST",
-            headers=headers,
+            headers={
+                **BROWSER_HEADERS,
+                "Content-Type":     "application/x-www-form-urlencoded",
+                "Accept":           "application/json, text/javascript, */*; q=0.01",
+                "Referer":          f"{BASE_URL}/users/sign_in",
+                "X-CSRF-Token":     token,
+                "X-Requested-With": "XMLHttpRequest",
+                "Sec-Fetch-Site":   "same-origin",
+                "Sec-Fetch-Mode":   "cors",
+                "Sec-Fetch-Dest":   "empty",
+            },
         )
         with self._opener.open(req, timeout=15) as r:
-            resp = json.loads(self._read(r))
-            log.info("Login response: %s", resp)
+            resp_body = self._read(r)
+            log.info("Login response (%s): %s", r.status, resp_body[:200])
         log.info("Login exitoso en suitch.network")
 
     def devices(self) -> list[dict]:
         req = urllib.request.Request(
             f"{BASE_URL}/devices/v2/show.json",
-            headers={**BROWSER_HEADERS, "Accept": "application/json"},
+            headers={
+                **BROWSER_HEADERS,
+                "Accept":         "application/json",
+                "Referer":        f"{BASE_URL}/",
+                "Sec-Fetch-Site": "same-origin",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Dest": "empty",
+            },
         )
         with self._opener.open(req, timeout=15) as r:
             data = json.loads(self._read(r))
