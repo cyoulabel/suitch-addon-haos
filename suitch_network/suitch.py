@@ -28,36 +28,27 @@ SSL_CTX = ssl.create_default_context()
 SSL_CTX.check_hostname = False
 SSL_CTX.verify_mode    = ssl.CERT_NONE
 
-# Headers que imitan un browser real — evitan el 403
 BROWSER_HEADERS = {
     "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept-Language": "es-MX,es;q=0.9,en;q=0.8",
-    "Accept-Encoding": "gzip, deflate, br",
     "Connection":      "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
 }
 
 
 # ─────────────────────────────────────────────────────────────
-#  Credenciales desde /data/options.json (UI del addon)
+#  Credenciales desde /data/options.json
 # ─────────────────────────────────────────────────────────────
 
 def load_config() -> dict:
     options_file = "/data/options.json"
     if not os.path.exists(options_file):
-        raise FileNotFoundError(
-            "No se encontró /data/options.json — "
-            "configura email y password en la pestaña 'Configuration' del addon."
-        )
+        raise FileNotFoundError("No se encontró /data/options.json")
     with open(options_file, encoding="utf-8") as f:
         opts = json.load(f)
-
     email    = opts.get("email", "").strip()
     password = opts.get("password", "").strip()
-
     if not email or not password:
         raise ValueError("Email o password vacíos — revisa la pestaña 'Configuration'.")
-
     return {
         "email":         email,
         "password":      password,
@@ -122,67 +113,73 @@ class SuitchClient:
             https_handler,
         )
 
-    def _get(self, url: str, accept="application/json") -> bytes:
-        req = urllib.request.Request(url, headers={
-            **BROWSER_HEADERS,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-                      if accept == "text/html" else accept,
-        })
-        with self._opener.open(req, timeout=15) as r:
-            raw = r.read()
-            # descomprimir gzip si aplica
-            if r.headers.get("Content-Encoding") == "gzip":
-                import gzip
-                raw = gzip.decompress(raw)
-            return raw
+    def _read(self, resp) -> bytes:
+        raw = resp.read()
+        if resp.headers.get("Content-Encoding") == "gzip":
+            import gzip
+            raw = gzip.decompress(raw)
+        return raw
 
-    def _post(self, url: str, data: dict, extra: dict = {}) -> bytes:
-        payload = urllib.parse.urlencode(data).encode("utf-8")
-        req = urllib.request.Request(
-            url, data=payload, method="POST",
-            headers={
-                **BROWSER_HEADERS,
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Accept":        "application/json, text/javascript, */*; q=0.01",
-                "X-Requested-With": "XMLHttpRequest",
-                **extra,
-            },
-        )
-        with self._opener.open(req, timeout=15) as r:
-            raw = r.read()
-            if r.headers.get("Content-Encoding") == "gzip":
-                import gzip
-                raw = gzip.decompress(raw)
-            return raw
-
-    def _csrf(self) -> str:
-        raw = self._get(f"{BASE_URL}/users/sign_in", accept="text/html")
-        p = _CSRFParser()
-        p.feed(raw.decode("utf-8", errors="replace"))
-        if not p.token:
-            raise RuntimeError("CSRF token no encontrado")
-        log.info("CSRF token obtenido")
-        return p.token
+    def _get_csrf(self) -> str | None:
+        """
+        Intenta obtener el CSRF token desde la raíz del sitio.
+        Si falla con 403, regresa None y el login procede sin él.
+        """
+        for url in [f"{BASE_URL}/", f"{BASE_URL}/login"]:
+            try:
+                req = urllib.request.Request(url, headers={
+                    **BROWSER_HEADERS,
+                    "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+                })
+                with self._opener.open(req, timeout=15) as r:
+                    raw = self._read(r)
+                p = _CSRFParser()
+                p.feed(raw.decode("utf-8", errors="replace"))
+                if p.token:
+                    log.info("CSRF token obtenido desde %s", url)
+                    return p.token
+            except Exception as e:
+                log.debug("CSRF fetch fallido en %s: %s", url, e)
+        log.warning("No se obtuvo CSRF token — intentando login sin él")
+        return None
 
     def login(self) -> None:
         self._opener = self._new_opener()
-        token = self._csrf()
-        self._post(
+        token = self._get_csrf()
+
+        # Intentar login con JSON body (no requiere CSRF en Rails API)
+        payload = json.dumps({
+            "email":    self._email,
+            "password": self._password,
+        }).encode("utf-8")
+
+        headers = {
+            **BROWSER_HEADERS,
+            "Content-Type":     "application/json",
+            "Accept":           "application/json",
+            "X-Requested-With": "XMLHttpRequest",
+        }
+        if token:
+            headers["X-CSRF-Token"] = token
+
+        req = urllib.request.Request(
             f"{BASE_URL}/auth/v2/login.json",
-            data={
-                "email": self._email, "password": self._password,
-                "authenticity_token": token, "utf8": "✓",
-            },
-            extra={
-                "Referer":      f"{BASE_URL}/users/sign_in",
-                "X-CSRF-Token": token,
-            },
+            data=payload,
+            method="POST",
+            headers=headers,
         )
+        with self._opener.open(req, timeout=15) as r:
+            resp = json.loads(self._read(r))
+            log.info("Login response: %s", resp)
         log.info("Login exitoso en suitch.network")
 
     def devices(self) -> list[dict]:
-        raw  = self._get(f"{BASE_URL}/devices/v2/show.json")
-        data = json.loads(raw)
+        req = urllib.request.Request(
+            f"{BASE_URL}/devices/v2/show.json",
+            headers={**BROWSER_HEADERS, "Accept": "application/json"},
+        )
+        with self._opener.open(req, timeout=15) as r:
+            data = json.loads(self._read(r))
         return data if isinstance(data, list) else data.get("devices", [])
 
 
