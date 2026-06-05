@@ -7,13 +7,11 @@ Sin dependencias externas (stdlib pura).
 import json
 import logging
 import os
-import re
 import ssl
 import time
 import urllib.request
 import urllib.parse
 import http.cookiejar
-import html.parser
 from typing import Any
 
 logging.basicConfig(
@@ -30,19 +28,14 @@ SSL_CTX.check_hostname = False
 SSL_CTX.verify_mode    = ssl.CERT_NONE
 
 BROWSER_HEADERS = {
-    "User-Agent":                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept-Language":           "es-MX,es;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Accept-Encoding":           "gzip, deflate, br",
-    "Connection":                "keep-alive",
-    "Sec-Ch-Ua":                 '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-    "Sec-Ch-Ua-Mobile":          "?0",
-    "Sec-Ch-Ua-Platform":        '"Windows"',
-    "Upgrade-Insecure-Requests": "1",
+    "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept-Language": "es-MX,es;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Connection":      "keep-alive",
 }
 
 
 # ─────────────────────────────────────────────────────────────
-#  Credenciales desde /data/options.json
+#  Credenciales
 # ─────────────────────────────────────────────────────────────
 
 def load_config() -> dict:
@@ -75,10 +68,7 @@ def ha_set_state(entity_id: str, state: Any, attributes: dict = {}) -> bool:
     payload = json.dumps({"state": state, "attributes": attributes}).encode("utf-8")
     req = urllib.request.Request(
         url, data=payload, method="POST",
-        headers={
-            "Authorization": f"Bearer {HA_TOKEN}",
-            "Content-Type":  "application/json",
-        },
+        headers={"Authorization": f"Bearer {HA_TOKEN}", "Content-Type": "application/json"},
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
@@ -89,70 +79,6 @@ def ha_set_state(entity_id: str, state: Any, attributes: dict = {}) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────
-#  Parsers de CSRF
-# ─────────────────────────────────────────────────────────────
-
-class _CSRFParser(html.parser.HTMLParser):
-    """Busca el token en meta tags e inputs hidden."""
-    def __init__(self):
-        super().__init__()
-        self.token: str | None = None
-
-    def handle_starttag(self, tag, attrs):
-        attrs = dict(attrs)
-        if tag == "meta" and attrs.get("name") == "csrf-token":
-            self.token = attrs.get("content")
-        if tag == "input" and attrs.get("name") == "authenticity_token":
-            self.token = attrs.get("value")
-        if attrs.get("data-authenticity-token"):
-            self.token = attrs["data-authenticity-token"]
-
-
-def _extract_csrf_from_html(html_text: str) -> str | None:
-    """
-    Busca el CSRF token en cualquier lugar del HTML/JS:
-    - <meta name="csrf-token">
-    - <input name="authenticity_token">
-    - data-authenticity-token="..."
-    - "authenticity_token":"..." en JSON embebido
-    - window.csrfToken = "..."
-    - gon.authenticity_token = "..."
-    """
-    # 1. Parser HTML estándar
-    p = _CSRFParser()
-    p.feed(html_text)
-    if p.token:
-        return p.token
-
-    # 2. Regex en el HTML/JS — busca el token en cualquier forma
-    patterns = [
-        r'"authenticity_token"\s*[=:]\s*["\']([A-Za-z0-9+/=_\-]{20,})["\']',
-        r'authenticity_token["\']?\s*[=:]\s*["\']([A-Za-z0-9+/=_\-]{20,})["\']',
-        r'csrf[_\-]token["\']?\s*[=:]\s*["\']([A-Za-z0-9+/=_\-]{20,})["\']',
-        r'csrfToken["\']?\s*[=:]\s*["\']([A-Za-z0-9+/=_\-]{20,})["\']',
-        r'content="([A-Za-z0-9+/=_\-]{40,})"[^>]*name="csrf-token"',
-        r'name="csrf-token"[^>]*content="([A-Za-z0-9+/=_\-]{40,})"',
-    ]
-    for pat in patterns:
-        m = re.search(pat, html_text, re.IGNORECASE)
-        if m:
-            log.info("CSRF token encontrado vía regex: %s", pat)
-            return m.group(1)
-
-    return None
-
-
-def _extract_csrf_from_cookies(jar: http.cookiejar.CookieJar) -> str | None:
-    """Busca el CSRF token en las cookies (XSRF-TOKEN, csrf-token, etc.)."""
-    csrf_names = {"xsrf-token", "csrf-token", "csrf_token", "x-csrf-token", "_csrf"}
-    for cookie in jar:
-        if cookie.name.lower() in csrf_names:
-            log.info("CSRF token encontrado en cookie: %s", cookie.name)
-            return urllib.parse.unquote(cookie.value)
-    return None
-
-
-# ─────────────────────────────────────────────────────────────
 #  Cliente suitch.network
 # ─────────────────────────────────────────────────────────────
 
@@ -160,15 +86,13 @@ class SuitchClient:
     def __init__(self, email: str, password: str):
         self._email    = email
         self._password = password
-        self._jar      = http.cookiejar.CookieJar()
         self._opener   = self._new_opener()
 
     def _new_opener(self):
-        self._jar = http.cookiejar.CookieJar()
-        https_handler = urllib.request.HTTPSHandler(context=SSL_CTX)
+        jar = http.cookiejar.CookieJar()
         return urllib.request.build_opener(
-            urllib.request.HTTPCookieProcessor(self._jar),
-            https_handler,
+            urllib.request.HTTPCookieProcessor(jar),
+            urllib.request.HTTPSHandler(context=SSL_CTX),
         )
 
     def _read(self, resp) -> bytes:
@@ -178,97 +102,90 @@ class SuitchClient:
             raw = gzip.decompress(raw)
         return raw
 
-    def _get_csrf(self) -> str:
-        """Intenta obtener el CSRF token desde varias fuentes."""
-        candidates = [
-            f"{BASE_URL}/users/sign_in",
-            f"{BASE_URL}/",
-            f"{BASE_URL}/login",
-        ]
-        for url in candidates:
-            try:
-                req = urllib.request.Request(url, headers={
-                    **BROWSER_HEADERS,
-                    "Accept":           "text/html,application/xhtml+xml,*/*;q=0.8",
-                    "Sec-Fetch-Site":   "none",
-                    "Sec-Fetch-Mode":   "navigate",
-                    "Sec-Fetch-User":   "?1",
-                    "Sec-Fetch-Dest":   "document",
-                })
-                with self._opener.open(req, timeout=15) as r:
-                    status = r.status
-                    raw    = self._read(r)
-
-                html_text = raw.decode("utf-8", errors="replace")
-                log.info("GET %s → %s (%d bytes)", url, status, len(html_text))
-
-                # 1. Buscar en HTML/JS
-                token = _extract_csrf_from_html(html_text)
-                if token:
-                    log.info("CSRF desde HTML en %s: %s...", url, token[:20])
-                    return token
-
-                # 2. Buscar en cookies
-                token = _extract_csrf_from_cookies(self._jar)
-                if token:
-                    log.info("CSRF desde cookie: %s...", token[:20])
-                    return token
-
-                # Debug: listar cookies recibidas
-                cookie_names = [c.name for c in self._jar]
-                log.info("Cookies tras GET %s: %s", url, cookie_names)
-
-            except Exception as e:
-                log.warning("GET %s → %s", url, e)
-
-        raise RuntimeError(
-            "No se encontró el CSRF token. "
-            "Revisa el log para ver qué cookies/HTML devuelve suitch.network."
-        )
+    def _try_login(self, url: str, payload: bytes, headers: dict) -> bool:
+        """Intenta un login, devuelve True si exitoso, False si 4xx."""
+        try:
+            req = urllib.request.Request(url, data=payload, method="POST", headers=headers)
+            with self._opener.open(req, timeout=15) as r:
+                body = self._read(r)
+                log.info("  ✓ %s → %s: %s", url, r.status, body[:200])
+                return True
+        except urllib.error.HTTPError as e:
+            body = e.read()[:300]
+            log.warning("  ✗ %s → %s: %s", url, e.code, body)
+            return False
+        except Exception as e:
+            log.warning("  ✗ %s → %s", url, e)
+            return False
 
     def login(self) -> None:
         self._opener = self._new_opener()
-        token = self._get_csrf()
+        log.info("Intentando login en suitch.network...")
 
-        payload = urllib.parse.urlencode({
-            "email":              self._email,
-            "password":           self._password,
-            "authenticity_token": token,
-            "utf8":               "✓",
-        }).encode("utf-8")
-
-        req = urllib.request.Request(
+        # ── Intento 1: JSON a /auth/v2/login.json (sin CSRF — Rails lo omite para JSON) ──
+        log.info("Intento 1: JSON → /auth/v2/login.json")
+        payload = json.dumps({"email": self._email, "password": self._password}).encode("utf-8")
+        if self._try_login(
             f"{BASE_URL}/auth/v2/login.json",
-            data=payload,
-            method="POST",
-            headers={
-                **BROWSER_HEADERS,
-                "Content-Type":     "application/x-www-form-urlencoded",
-                "Accept":           "application/json, text/javascript, */*; q=0.01",
-                "Referer":          f"{BASE_URL}/users/sign_in",
-                "X-CSRF-Token":     token,
-                "X-Requested-With": "XMLHttpRequest",
-                "Sec-Fetch-Site":   "same-origin",
-                "Sec-Fetch-Mode":   "cors",
-                "Sec-Fetch-Dest":   "empty",
-            },
+            payload,
+            {**BROWSER_HEADERS,
+             "Content-Type": "application/json",
+             "Accept": "application/json",
+             "X-Requested-With": "XMLHttpRequest"},
+        ):
+            return
+
+        # ── Intento 2: JSON Devise estándar → /users/sign_in.json ──
+        log.info("Intento 2: JSON Devise → /users/sign_in.json")
+        payload = json.dumps({"user": {"email": self._email, "password": self._password}}).encode("utf-8")
+        if self._try_login(
+            f"{BASE_URL}/users/sign_in.json",
+            payload,
+            {**BROWSER_HEADERS,
+             "Content-Type": "application/json",
+             "Accept": "application/json"},
+        ):
+            return
+
+        # ── Intento 3: form-encoded sin CSRF → /auth/v2/login.json ──
+        log.info("Intento 3: form-encoded sin CSRF → /auth/v2/login.json")
+        payload = urllib.parse.urlencode({
+            "email": self._email, "password": self._password, "utf8": "✓",
+        }).encode("utf-8")
+        if self._try_login(
+            f"{BASE_URL}/auth/v2/login.json",
+            payload,
+            {**BROWSER_HEADERS,
+             "Content-Type": "application/x-www-form-urlencoded",
+             "Accept": "application/json",
+             "X-Requested-With": "XMLHttpRequest"},
+        ):
+            return
+
+        # ── Intento 4: form-encoded sin CSRF → /users/sign_in ──
+        log.info("Intento 4: form-encoded sin CSRF → /users/sign_in")
+        payload = urllib.parse.urlencode({
+            "user[email]": self._email, "user[password]": self._password, "utf8": "✓",
+        }).encode("utf-8")
+        if self._try_login(
+            f"{BASE_URL}/users/sign_in",
+            payload,
+            {**BROWSER_HEADERS,
+             "Content-Type": "application/x-www-form-urlencoded",
+             "Accept": "application/json, text/html",
+             "X-Requested-With": "XMLHttpRequest"},
+        ):
+            return
+
+        raise RuntimeError(
+            "Todos los intentos de login fallaron. "
+            "Revisa el log para ver las respuestas del servidor."
         )
-        with self._opener.open(req, timeout=15) as r:
-            body = self._read(r)
-            log.info("Login response (%s): %s", r.status, body[:300])
-        log.info("Login exitoso en suitch.network")
 
     def devices(self) -> list[dict]:
         req = urllib.request.Request(
             f"{BASE_URL}/devices/v2/show.json",
-            headers={
-                **BROWSER_HEADERS,
-                "Accept":           "application/json",
-                "Referer":          f"{BASE_URL}/",
-                "Sec-Fetch-Site":   "same-origin",
-                "Sec-Fetch-Mode":   "cors",
-                "Sec-Fetch-Dest":   "empty",
-            },
+            headers={**BROWSER_HEADERS, "Accept": "application/json"},
         )
         with self._opener.open(req, timeout=15) as r:
             data = json.loads(self._read(r))
@@ -326,7 +243,6 @@ def main() -> None:
     interval = cfg["scan_interval"]
 
     log.info("Addon arrancado — polling cada %ds", interval)
-
     client.login()
 
     while True:
@@ -341,7 +257,6 @@ def main() -> None:
                 client.login()
             except Exception as le:
                 log.error("Re-login fallido: %s — reintentando en %ds", le, interval)
-
         time.sleep(interval)
 
 
