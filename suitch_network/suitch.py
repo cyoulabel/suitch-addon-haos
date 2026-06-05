@@ -7,10 +7,12 @@ Sin dependencias externas (stdlib pura).
 import json
 import logging
 import os
+import re
 import ssl
 import time
 import urllib.request
 import urllib.parse
+import urllib.error
 import http.cookiejar
 from typing import Any
 
@@ -28,6 +30,15 @@ SSL_CTX.check_hostname = False
 SSL_CTX.verify_mode    = ssl.CERT_NONE
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
+
+# ─────────────────────────────────────────────────────────────
+#  Redirect handler que NO sigue — necesario para capturar Location
+# ─────────────────────────────────────────────────────────────
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None  # no seguir
 
 
 # ─────────────────────────────────────────────────────────────
@@ -78,14 +89,18 @@ class SuitchClient:
     def __init__(self, email: str, password: str):
         self._email    = email
         self._password = password
+        self._jar      = http.cookiejar.CookieJar()
         self._opener   = self._new_opener()
 
-    def _new_opener(self):
-        jar = http.cookiejar.CookieJar()
-        return urllib.request.build_opener(
-            urllib.request.HTTPCookieProcessor(jar),
+    def _new_opener(self, follow_redirects=True):
+        self._jar = http.cookiejar.CookieJar()
+        handlers = [
+            urllib.request.HTTPCookieProcessor(self._jar),
             urllib.request.HTTPSHandler(context=SSL_CTX),
-        )
+        ]
+        if not follow_redirects:
+            handlers.append(NoRedirect())
+        return urllib.request.build_opener(*handlers)
 
     def _read(self, resp) -> bytes:
         raw = resp.read()
@@ -94,39 +109,57 @@ class SuitchClient:
             raw = gzip.decompress(raw)
         return raw
 
-    def _get_token(self) -> str:
+    def _get_token_from_redirect(self) -> str | None:
         """
-        Obtiene el token desde POST /auth/cookie.json
-        (endpoint del JS comentado pero probablemente activo).
+        Accede a endpoints protegidos sin seguir redirects.
+        Rails redirige a /login?token=XXXX — capturamos ese token.
         """
-        req = urllib.request.Request(
-            f"{BASE_URL}/auth/cookie.json",
-            data=b"{}",
-            method="POST",
-            headers={
-                "User-Agent":   UA,
-                "Content-Type": "application/json",
-                "Accept":       "application/json",
-                "Referer":      f"{BASE_URL}/login",
-            },
-        )
-        with self._opener.open(req, timeout=15) as r:
-            body = self._read(r)
-            log.info("cookie.json response (%s): %s", r.status, body[:200])
-            data = json.loads(body)
-            token = data.get("token") or data.get("authenticity_token") or data.get("csrf_token")
-            if not token:
-                raise RuntimeError(f"cookie.json no devolvió token. Respuesta: {data}")
-            return token
+        opener_no_redir = self._new_opener(follow_redirects=False)
+
+        candidates = [
+            f"{BASE_URL}/devices",
+            f"{BASE_URL}/dashboard",
+            f"{BASE_URL}/home",
+            f"{BASE_URL}/profile",
+            f"{BASE_URL}/users/edit",
+        ]
+
+        for url in candidates:
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "text/html,*/*"})
+                with opener_no_redir.open(req, timeout=10) as r:
+                    location = r.headers.get("Location", "")
+                    log.info("GET %s → %s  Location: %s", url, r.status, location)
+                    m = re.search(r'[?&]token=([^&\s]+)', location)
+                    if m:
+                        log.info("Token encontrado en redirect de %s", url)
+                        return urllib.parse.unquote(m.group(1))
+            except urllib.error.HTTPError as e:
+                location = e.headers.get("Location", "")
+                log.info("GET %s → %s  Location: %s", url, e.code, location)
+                m = re.search(r'[?&]token=([^&\s]+)', location)
+                if m:
+                    log.info("Token encontrado en redirect (error) de %s", url)
+                    return urllib.parse.unquote(m.group(1))
+            except Exception as e:
+                log.warning("GET %s → %s", url, e)
+
+        return None
 
     def login(self) -> None:
         self._opener = self._new_opener()
 
-        log.info("Obteniendo token desde /auth/cookie.json...")
-        token = self._get_token()
+        log.info("Buscando token en redirects de endpoints protegidos...")
+        token = self._get_token_from_redirect()
+
+        if not token:
+            raise RuntimeError(
+                "No se encontró ?token= en ningún redirect. "
+                "Revisa el log para ver los Location headers."
+            )
+
         log.info("Token obtenido: %s...", token[:20])
 
-        # Login en /auth/webLogin.json con campo _token
         payload = urllib.parse.urlencode({
             "email":    self._email,
             "password": self._password,
@@ -141,7 +174,7 @@ class SuitchClient:
                 "User-Agent":       UA,
                 "Content-Type":     "application/x-www-form-urlencoded",
                 "Accept":           "application/json",
-                "Referer":          f"{BASE_URL}/login",
+                "Referer":          f"{BASE_URL}/login?token={token}",
                 "X-Requested-With": "XMLHttpRequest",
             },
         )
