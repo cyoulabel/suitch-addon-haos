@@ -12,7 +12,6 @@ import ssl
 import time
 import urllib.request
 import urllib.parse
-import urllib.error
 import http.cookiejar
 from typing import Any
 
@@ -32,19 +31,6 @@ SSL_CTX.verify_mode    = ssl.CERT_NONE
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
 
-# ─────────────────────────────────────────────────────────────
-#  Redirect handler que NO sigue — necesario para capturar Location
-# ─────────────────────────────────────────────────────────────
-
-class NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None  # no seguir
-
-
-# ─────────────────────────────────────────────────────────────
-#  Credenciales
-# ─────────────────────────────────────────────────────────────
-
 def load_config() -> dict:
     with open("/data/options.json", encoding="utf-8") as f:
         opts = json.load(f)
@@ -58,10 +44,6 @@ def load_config() -> dict:
         "scan_interval": int(opts.get("scan_interval", 60)),
     }
 
-
-# ─────────────────────────────────────────────────────────────
-#  HA Supervisor API
-# ─────────────────────────────────────────────────────────────
 
 HA_API   = "http://supervisor/core/api"
 HA_TOKEN = os.environ.get("SUPERVISOR_TOKEN", "")
@@ -81,26 +63,18 @@ def ha_set_state(entity_id: str, state: Any, attributes: dict = {}) -> bool:
         return False
 
 
-# ─────────────────────────────────────────────────────────────
-#  Cliente suitch.network
-# ─────────────────────────────────────────────────────────────
-
 class SuitchClient:
     def __init__(self, email: str, password: str):
         self._email    = email
         self._password = password
-        self._jar      = http.cookiejar.CookieJar()
         self._opener   = self._new_opener()
 
-    def _new_opener(self, follow_redirects=True):
-        self._jar = http.cookiejar.CookieJar()
-        handlers = [
-            urllib.request.HTTPCookieProcessor(self._jar),
+    def _new_opener(self):
+        jar = http.cookiejar.CookieJar()
+        return urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(jar),
             urllib.request.HTTPSHandler(context=SSL_CTX),
-        ]
-        if not follow_redirects:
-            handlers.append(NoRedirect())
-        return urllib.request.build_opener(*handlers)
+        )
 
     def _read(self, resp) -> bytes:
         raw = resp.read()
@@ -109,72 +83,65 @@ class SuitchClient:
             raw = gzip.decompress(raw)
         return raw
 
-    def _get_token_from_redirect(self) -> str | None:
+    def _get_csrf(self) -> str:
         """
-        Accede a endpoints protegidos sin seguir redirects.
-        Rails redirige a /login?token=XXXX — capturamos ese token.
+        Obtiene el CSRF token desde la página principal con regex robusta.
+        El token está en <meta name="csrf-token" content="..."> cerca del
+        final de los 72KB de HTML (después del JS de New Relic).
         """
-        opener_no_redir = self._new_opener(follow_redirects=False)
+        req = urllib.request.Request(
+            f"{BASE_URL}/",
+            headers={
+                "User-Agent":    UA,
+                "Accept":        "text/html,application/xhtml+xml,*/*;q=0.8",
+                "Cache-Control": "no-cache",
+            },
+        )
+        with self._opener.open(req, timeout=20) as r:
+            raw  = self._read(r)
+            text = raw.decode("utf-8", errors="replace")
 
-        candidates = [
-            f"{BASE_URL}/devices",
-            f"{BASE_URL}/dashboard",
-            f"{BASE_URL}/home",
-            f"{BASE_URL}/profile",
-            f"{BASE_URL}/users/edit",
+        log.info("GET / → %s (%d bytes)", r.status, len(text))
+
+        # Regex que funciona aunque el tag esté en cualquier posición
+        # y aunque html.parser falle por el JS minificado de NR
+        patterns = [
+            r'<meta[^>]*name=["\']csrf-token["\'][^>]*content=["\']([^"\']+)["\']',
+            r'<meta[^>]*content=["\']([A-Za-z0-9+/=_\-]{40,})["\'][^>]*name=["\']csrf-token["\']',
+            r'csrf-token["\'][^>]*content=["\']([A-Za-z0-9+/=_\-]{40,})["\']',
         ]
+        for pat in patterns:
+            m = re.search(pat, text, re.IGNORECASE | re.DOTALL)
+            if m:
+                token = m.group(1)
+                log.info("CSRF token encontrado (%d chars): %s...", len(token), token[:20])
+                return token
 
-        for url in candidates:
-            try:
-                req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "text/html,*/*"})
-                with opener_no_redir.open(req, timeout=10) as r:
-                    location = r.headers.get("Location", "")
-                    log.info("GET %s → %s  Location: %s", url, r.status, location)
-                    m = re.search(r'[?&]token=([^&\s]+)', location)
-                    if m:
-                        log.info("Token encontrado en redirect de %s", url)
-                        return urllib.parse.unquote(m.group(1))
-            except urllib.error.HTTPError as e:
-                location = e.headers.get("Location", "")
-                log.info("GET %s → %s  Location: %s", url, e.code, location)
-                m = re.search(r'[?&]token=([^&\s]+)', location)
-                if m:
-                    log.info("Token encontrado en redirect (error) de %s", url)
-                    return urllib.parse.unquote(m.group(1))
-            except Exception as e:
-                log.warning("GET %s → %s", url, e)
-
-        return None
+        # Debug — mostrar últimos 500 chars donde debería estar el token
+        log.warning("Token NO encontrado. Últimos 500 chars: %s", text[-500:])
+        raise RuntimeError("No se encontró csrf-token en la página /")
 
     def login(self) -> None:
         self._opener = self._new_opener()
-
-        log.info("Buscando token en redirects de endpoints protegidos...")
-        token = self._get_token_from_redirect()
-
-        if not token:
-            raise RuntimeError(
-                "No se encontró ?token= en ningún redirect. "
-                "Revisa el log para ver los Location headers."
-            )
-
-        log.info("Token obtenido: %s...", token[:20])
+        token = self._get_csrf()
 
         payload = urllib.parse.urlencode({
-            "email":    self._email,
-            "password": self._password,
-            "_token":   token,
+            "email":              self._email,
+            "password":           self._password,
+            "authenticity_token": token,
+            "utf8":               "✓",
         }).encode("utf-8")
 
         req = urllib.request.Request(
-            f"{BASE_URL}/auth/webLogin.json",
+            f"{BASE_URL}/auth/v2/login.json",
             data=payload,
             method="POST",
             headers={
                 "User-Agent":       UA,
                 "Content-Type":     "application/x-www-form-urlencoded",
                 "Accept":           "application/json",
-                "Referer":          f"{BASE_URL}/login?token={token}",
+                "Referer":          f"{BASE_URL}/",
+                "X-CSRF-Token":     token,
                 "X-Requested-With": "XMLHttpRequest",
             },
         )
@@ -192,10 +159,6 @@ class SuitchClient:
             data = json.loads(self._read(r))
         return data if isinstance(data, list) else data.get("devices", [])
 
-
-# ─────────────────────────────────────────────────────────────
-#  Publicar dispositivos en HA
-# ─────────────────────────────────────────────────────────────
 
 def _unit_and_class(field: str):
     f = field.lower()
@@ -226,10 +189,6 @@ def publish_device(dev: dict) -> None:
         ha_set_state(f"sensor.suitch_{slug}_state", "online",
                      {"friendly_name": f"Suitch {name}", "device_uid": uid, "raw": dev})
 
-
-# ─────────────────────────────────────────────────────────────
-#  Main loop
-# ─────────────────────────────────────────────────────────────
 
 def main() -> None:
     cfg      = load_config()
