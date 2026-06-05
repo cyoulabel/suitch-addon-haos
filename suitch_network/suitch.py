@@ -24,10 +24,18 @@ log = logging.getLogger("suitch")
 
 BASE_URL = "https://suitch.network"
 
-# SSL context — deshabilita verificación si el cert de suitch.network está vencido
 SSL_CTX = ssl.create_default_context()
 SSL_CTX.check_hostname = False
 SSL_CTX.verify_mode    = ssl.CERT_NONE
+
+# Headers que imitan un browser real — evitan el 403
+BROWSER_HEADERS = {
+    "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept-Language": "es-MX,es;q=0.9,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection":      "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -58,7 +66,7 @@ def load_config() -> dict:
 
 
 # ─────────────────────────────────────────────────────────────
-#  HA Supervisor API  (red Docker interna, sin puerto externo)
+#  HA Supervisor API
 # ─────────────────────────────────────────────────────────────
 
 HA_API   = "http://supervisor/core/api"
@@ -116,25 +124,36 @@ class SuitchClient:
 
     def _get(self, url: str, accept="application/json") -> bytes:
         req = urllib.request.Request(url, headers={
-            "Accept":     accept,
-            "User-Agent": "Mozilla/5.0 (HA-suitch-addon/1.0)",
+            **BROWSER_HEADERS,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+                      if accept == "text/html" else accept,
         })
         with self._opener.open(req, timeout=15) as r:
-            return r.read()
+            raw = r.read()
+            # descomprimir gzip si aplica
+            if r.headers.get("Content-Encoding") == "gzip":
+                import gzip
+                raw = gzip.decompress(raw)
+            return raw
 
     def _post(self, url: str, data: dict, extra: dict = {}) -> bytes:
         payload = urllib.parse.urlencode(data).encode("utf-8")
         req = urllib.request.Request(
             url, data=payload, method="POST",
             headers={
+                **BROWSER_HEADERS,
                 "Content-Type": "application/x-www-form-urlencoded",
-                "Accept":        "application/json",
-                "User-Agent":    "Mozilla/5.0 (HA-suitch-addon/1.0)",
+                "Accept":        "application/json, text/javascript, */*; q=0.01",
+                "X-Requested-With": "XMLHttpRequest",
                 **extra,
             },
         )
         with self._opener.open(req, timeout=15) as r:
-            return r.read()
+            raw = r.read()
+            if r.headers.get("Content-Encoding") == "gzip":
+                import gzip
+                raw = gzip.decompress(raw)
+            return raw
 
     def _csrf(self) -> str:
         raw = self._get(f"{BASE_URL}/users/sign_in", accept="text/html")
@@ -142,6 +161,7 @@ class SuitchClient:
         p.feed(raw.decode("utf-8", errors="replace"))
         if not p.token:
             raise RuntimeError("CSRF token no encontrado")
+        log.info("CSRF token obtenido")
         return p.token
 
     def login(self) -> None:
@@ -153,7 +173,10 @@ class SuitchClient:
                 "email": self._email, "password": self._password,
                 "authenticity_token": token, "utf8": "✓",
             },
-            extra={"Referer": f"{BASE_URL}/users/sign_in", "X-CSRF-Token": token},
+            extra={
+                "Referer":      f"{BASE_URL}/users/sign_in",
+                "X-CSRF-Token": token,
+            },
         )
         log.info("Login exitoso en suitch.network")
 
@@ -214,7 +237,6 @@ def main() -> None:
     interval = cfg["scan_interval"]
 
     log.info("Addon arrancado — polling cada %ds", interval)
-    log.info("Comunicación HA: %s  (sin puerto externo)", HA_API)
 
     client.login()
 
