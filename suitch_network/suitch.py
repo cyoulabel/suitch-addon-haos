@@ -7,6 +7,7 @@ Sin dependencias externas (stdlib pura).
 import json
 import logging
 import os
+import re
 import ssl
 import time
 import urllib.request
@@ -28,7 +29,6 @@ SSL_CTX = ssl.create_default_context()
 SSL_CTX.check_hostname = False
 SSL_CTX.verify_mode    = ssl.CERT_NONE
 
-# Headers completos que imitan Chrome — necesarios para pasar Cloudflare/WAF
 BROWSER_HEADERS = {
     "User-Agent":                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept-Language":           "es-MX,es;q=0.9,en-US;q=0.8,en;q=0.7",
@@ -37,10 +37,6 @@ BROWSER_HEADERS = {
     "Sec-Ch-Ua":                 '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
     "Sec-Ch-Ua-Mobile":          "?0",
     "Sec-Ch-Ua-Platform":        '"Windows"',
-    "Sec-Fetch-Site":            "none",
-    "Sec-Fetch-Mode":            "navigate",
-    "Sec-Fetch-User":            "?1",
-    "Sec-Fetch-Dest":            "document",
     "Upgrade-Insecure-Requests": "1",
 }
 
@@ -93,10 +89,11 @@ def ha_set_state(entity_id: str, state: Any, attributes: dict = {}) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────
-#  Cliente suitch.network
+#  Parsers de CSRF
 # ─────────────────────────────────────────────────────────────
 
 class _CSRFParser(html.parser.HTMLParser):
+    """Busca el token en meta tags e inputs hidden."""
     def __init__(self):
         super().__init__()
         self.token: str | None = None
@@ -107,19 +104,70 @@ class _CSRFParser(html.parser.HTMLParser):
             self.token = attrs.get("content")
         if tag == "input" and attrs.get("name") == "authenticity_token":
             self.token = attrs.get("value")
+        if attrs.get("data-authenticity-token"):
+            self.token = attrs["data-authenticity-token"]
 
+
+def _extract_csrf_from_html(html_text: str) -> str | None:
+    """
+    Busca el CSRF token en cualquier lugar del HTML/JS:
+    - <meta name="csrf-token">
+    - <input name="authenticity_token">
+    - data-authenticity-token="..."
+    - "authenticity_token":"..." en JSON embebido
+    - window.csrfToken = "..."
+    - gon.authenticity_token = "..."
+    """
+    # 1. Parser HTML estándar
+    p = _CSRFParser()
+    p.feed(html_text)
+    if p.token:
+        return p.token
+
+    # 2. Regex en el HTML/JS — busca el token en cualquier forma
+    patterns = [
+        r'"authenticity_token"\s*[=:]\s*["\']([A-Za-z0-9+/=_\-]{20,})["\']',
+        r'authenticity_token["\']?\s*[=:]\s*["\']([A-Za-z0-9+/=_\-]{20,})["\']',
+        r'csrf[_\-]token["\']?\s*[=:]\s*["\']([A-Za-z0-9+/=_\-]{20,})["\']',
+        r'csrfToken["\']?\s*[=:]\s*["\']([A-Za-z0-9+/=_\-]{20,})["\']',
+        r'content="([A-Za-z0-9+/=_\-]{40,})"[^>]*name="csrf-token"',
+        r'name="csrf-token"[^>]*content="([A-Za-z0-9+/=_\-]{40,})"',
+    ]
+    for pat in patterns:
+        m = re.search(pat, html_text, re.IGNORECASE)
+        if m:
+            log.info("CSRF token encontrado vía regex: %s", pat)
+            return m.group(1)
+
+    return None
+
+
+def _extract_csrf_from_cookies(jar: http.cookiejar.CookieJar) -> str | None:
+    """Busca el CSRF token en las cookies (XSRF-TOKEN, csrf-token, etc.)."""
+    csrf_names = {"xsrf-token", "csrf-token", "csrf_token", "x-csrf-token", "_csrf"}
+    for cookie in jar:
+        if cookie.name.lower() in csrf_names:
+            log.info("CSRF token encontrado en cookie: %s", cookie.name)
+            return urllib.parse.unquote(cookie.value)
+    return None
+
+
+# ─────────────────────────────────────────────────────────────
+#  Cliente suitch.network
+# ─────────────────────────────────────────────────────────────
 
 class SuitchClient:
     def __init__(self, email: str, password: str):
         self._email    = email
         self._password = password
+        self._jar      = http.cookiejar.CookieJar()
         self._opener   = self._new_opener()
 
     def _new_opener(self):
-        jar = http.cookiejar.CookieJar()
+        self._jar = http.cookiejar.CookieJar()
         https_handler = urllib.request.HTTPSHandler(context=SSL_CTX)
         return urllib.request.build_opener(
-            urllib.request.HTTPCookieProcessor(jar),
+            urllib.request.HTTPCookieProcessor(self._jar),
             https_handler,
         )
 
@@ -131,10 +179,7 @@ class SuitchClient:
         return raw
 
     def _get_csrf(self) -> str:
-        """
-        Obtiene el CSRF token probando varias URLs públicas del sitio.
-        Lanza RuntimeError si no lo encuentra en ninguna.
-        """
+        """Intenta obtener el CSRF token desde varias fuentes."""
         candidates = [
             f"{BASE_URL}/users/sign_in",
             f"{BASE_URL}/",
@@ -144,31 +189,47 @@ class SuitchClient:
             try:
                 req = urllib.request.Request(url, headers={
                     **BROWSER_HEADERS,
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                    "Accept":           "text/html,application/xhtml+xml,*/*;q=0.8",
+                    "Sec-Fetch-Site":   "none",
+                    "Sec-Fetch-Mode":   "navigate",
+                    "Sec-Fetch-User":   "?1",
+                    "Sec-Fetch-Dest":   "document",
                 })
                 with self._opener.open(req, timeout=15) as r:
-                    log.info("GET %s → %s", url, r.status)
-                    raw = self._read(r)
-                p = _CSRFParser()
-                p.feed(raw.decode("utf-8", errors="replace"))
-                if p.token:
-                    log.info("CSRF token obtenido desde %s", url)
-                    return p.token
-                else:
-                    log.warning("GET %s OK pero sin CSRF token en el HTML", url)
+                    status = r.status
+                    raw    = self._read(r)
+
+                html_text = raw.decode("utf-8", errors="replace")
+                log.info("GET %s → %s (%d bytes)", url, status, len(html_text))
+
+                # 1. Buscar en HTML/JS
+                token = _extract_csrf_from_html(html_text)
+                if token:
+                    log.info("CSRF desde HTML en %s: %s...", url, token[:20])
+                    return token
+
+                # 2. Buscar en cookies
+                token = _extract_csrf_from_cookies(self._jar)
+                if token:
+                    log.info("CSRF desde cookie: %s...", token[:20])
+                    return token
+
+                # Debug: listar cookies recibidas
+                cookie_names = [c.name for c in self._jar]
+                log.info("Cookies tras GET %s: %s", url, cookie_names)
+
             except Exception as e:
                 log.warning("GET %s → %s", url, e)
 
         raise RuntimeError(
-            "No se pudo obtener el CSRF token desde ninguna URL. "
-            "Verifica que suitch.network sea accesible desde el addon."
+            "No se encontró el CSRF token. "
+            "Revisa el log para ver qué cookies/HTML devuelve suitch.network."
         )
 
     def login(self) -> None:
         self._opener = self._new_opener()
         token = self._get_csrf()
 
-        # Form-encoded igual que el browser
         payload = urllib.parse.urlencode({
             "email":              self._email,
             "password":           self._password,
@@ -193,8 +254,8 @@ class SuitchClient:
             },
         )
         with self._opener.open(req, timeout=15) as r:
-            resp_body = self._read(r)
-            log.info("Login response (%s): %s", r.status, resp_body[:200])
+            body = self._read(r)
+            log.info("Login response (%s): %s", r.status, body[:300])
         log.info("Login exitoso en suitch.network")
 
     def devices(self) -> list[dict]:
@@ -202,11 +263,11 @@ class SuitchClient:
             f"{BASE_URL}/devices/v2/show.json",
             headers={
                 **BROWSER_HEADERS,
-                "Accept":         "application/json",
-                "Referer":        f"{BASE_URL}/",
-                "Sec-Fetch-Site": "same-origin",
-                "Sec-Fetch-Mode": "cors",
-                "Sec-Fetch-Dest": "empty",
+                "Accept":           "application/json",
+                "Referer":          f"{BASE_URL}/",
+                "Sec-Fetch-Site":   "same-origin",
+                "Sec-Fetch-Mode":   "cors",
+                "Sec-Fetch-Dest":   "empty",
             },
         )
         with self._opener.open(req, timeout=15) as r:
