@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
-"""
-Suitch Network — DIAGNÓSTICO: buscar en app.js el endpoint de CSRF
-"""
+"""Suitch Network — DIAGNÓSTICO: contexto de authenticity_token en app.js"""
 
-import re, ssl, urllib.request, urllib.parse, http.cookiejar, gzip as gz, logging
+import re, ssl, urllib.request, http.cookiejar, gzip as gz, logging, json
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger()
@@ -11,75 +9,64 @@ log = logging.getLogger()
 SSL_CTX = ssl.create_default_context()
 SSL_CTX.check_hostname = False
 SSL_CTX.verify_mode    = ssl.CERT_NONE
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36"
+UA  = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36"
 BASE = "https://suitch.network"
 
 
-def fetch(url):
+def fetch(url, method="GET", data=None, headers={}):
     jar = http.cookiejar.CookieJar()
     opener = urllib.request.build_opener(
         urllib.request.HTTPCookieProcessor(jar),
         urllib.request.HTTPSHandler(context=SSL_CTX),
     )
-    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept-Encoding": "gzip"})
-    with opener.open(req, timeout=30) as r:
-        raw = r.read()
-        if r.headers.get("Content-Encoding") == "gzip":
-            raw = gz.decompress(raw)
-        return raw.decode("utf-8", errors="replace")
+    hdrs = {"User-Agent": UA, "Accept-Encoding": "gzip", "Accept": "application/json,*/*", **headers}
+    req = urllib.request.Request(url, data=data, method=method, headers=hdrs)
+    try:
+        with opener.open(req, timeout=15) as r:
+            raw = r.read()
+            if r.headers.get("Content-Encoding") == "gzip": raw = gz.decompress(raw)
+            return r.status, raw.decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        raw = e.read()
+        if e.headers.get("Content-Encoding") == "gzip": raw = gz.decompress(raw)
+        return e.code, raw.decode("utf-8", errors="replace")
 
 
 def main():
-    # 1. Obtener el nombre del app.js desde la página principal
-    log.info("Obteniendo nombre del app.js...")
-    index = fetch(f"{BASE}/")
+    # 1. Bajar app.js
+    status, index = fetch(f"{BASE}/")
     m = re.search(r'src="(/js/app\.[^"]+\.js)"', index)
-    if not m:
-        log.error("No se encontró app.js en el HTML")
-        return
-    app_js_path = m.group(1)
-    log.info("app.js: %s", app_js_path)
+    app_js_path = m.group(1) if m else "/js/app.49dc65c1.js"
+    log.info("Bajando %s...", app_js_path)
+    status, js = fetch(f"{BASE}{app_js_path}")
+    log.info("app.js: %d bytes", len(js))
 
-    # 2. Descargar app.js
-    log.info("Descargando app.js...")
-    js = fetch(f"{BASE}{app_js_path}")
-    log.info("app.js tamaño: %d bytes", len(js))
+    # 2. Contexto alrededor de CADA ocurrencia de authenticity_token
+    log.info("=== Contextos de authenticity_token ===")
+    for m in re.finditer(r'authenticity_token', js):
+        start = max(0, m.start() - 300)
+        end   = min(len(js), m.end() + 300)
+        log.info("--- pos %d ---\n%s", m.start(), js[start:end])
 
-    # 3. Buscar patrones de CSRF/token en el JS
-    patterns = [
-        r'csrf[_\-]?token',
-        r'authenticity_token',
-        r'/auth/[^\s"\']+',
-        r'cookie\.json',
-        r'token["\s]*:["\s]*function',
-        r'getToken\|fetchToken\|loadToken',
-        r'"token"[^,]{0,50}header',
-    ]
-    log.info("=== Buscando patrones en app.js ===")
-    for pat in patterns:
-        matches = re.findall(pat, js, re.IGNORECASE)
-        if matches:
-            log.info("Patrón [%s]: %s", pat, list(set(matches))[:5])
+    # 3. Rutas completas de /auth/
+    log.info("=== Todas las rutas /auth/ en app.js ===")
+    routes = re.findall(r'["\']/(auth/[^"\'?\s]{3,50})["\']', js)
+    for r in sorted(set(routes)):
+        log.info("  /%s", r)
 
-    # 4. Buscar URLs de API en el JS (rutas que empiezan con /auth o /api)
-    api_routes = re.findall(r'["\']/(auth|api|users)[^"\']{2,50}["\']', js)
-    unique_routes = list(set(api_routes))
-    log.info("=== Rutas de API encontradas en app.js ===")
-    for r in sorted(unique_routes):
-        log.info("  %s", r)
+    # 4. Probar GET /auth/v2/user.json (podría retornar token)
+    log.info("=== GET /auth/v2/user.json ===")
+    s, b = fetch(f"{BASE}/auth/v2/user.json")
+    log.info("Status %s | Body: %s", s, b[:300])
 
-    # 5. Guardar fragmento alrededor de "csrf" si existe
-    idx = js.lower().find("csrf")
-    if idx >= 0:
-        log.info("=== Contexto alrededor de 'csrf' (pos %d) ===", idx)
-        log.info("%s", js[max(0,idx-200):idx+300])
-    else:
-        idx2 = js.lower().find("token")
-        if idx2 >= 0:
-            log.info("=== Contexto alrededor de 'token' (pos %d) ===", idx2)
-            log.info("%s", js[max(0,idx2-200):idx2+300])
+    # 5. Buscar patrón headers con csrf/token en app.js
+    log.info("=== Headers con CSRF en app.js ===")
+    for m in re.finditer(r'[Xx]-?[Cc][Ss][Rr][Ff]|[Xx]-[Aa]uth', js):
+        start = max(0, m.start()-200)
+        end   = min(len(js), m.end()+200)
+        log.info("--- pos %d ---\n%s", m.start(), js[start:end])
 
-    log.info("=== FIN diagnóstico app.js ===")
+    log.info("=== FIN ===")
 
 
 if __name__ == "__main__":
