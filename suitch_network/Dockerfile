@@ -1,6 +1,7 @@
 FROM python:3.12-alpine
 
-RUN apk add --no-cache ca-certificates
+# Evitar segfault de OpenSSL en Alpine
+RUN apk add --no-cache ca-certificates openssl libssl3 libcrypto3
 
 WORKDIR /app
 COPY run.sh /run.sh
