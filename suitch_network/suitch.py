@@ -2,14 +2,6 @@
 """
 Suitch Network — Home Assistant Add-on
 Sin dependencias externas (stdlib pura).
-
-Flujo de login corregido para emular la web de suitch.network (Rails):
-    1) GET  /auth/v2/verify.json   -> devuelve {"token": "..."} (CSRF) y deja
-                                      la cookie de sesion en el cookie jar.
-    2) POST /auth/v2/login.json    -> con email, password, authenticity_token
-                                      (el token de verify) y utf8 = "✓".
-La autenticacion posterior se mantiene por la COOKIE de sesion (no Bearer).
-El authenticity_token solo se usa como proteccion CSRF en peticiones POST/PUT.
 """
 
 import json
@@ -44,11 +36,11 @@ def load_config() -> dict:
     if not email or not password:
         raise ValueError("Email o password vacíos — revisa Configuration.")
     return {
-        "email":         email,
-        "password":      password,
+        "email":        email,
+        "password":     password,
         "scan_interval": int(opts.get("scan_interval", 60)),
-        "id_token":      opts.get("id_token", "").strip(),
-        "insecure_ssl":  bool(opts.get("insecure_ssl", False)),
+        "id_token":     opts.get("id_token", "").strip(),
+        "insecure_ssl": bool(opts.get("insecure_ssl", False)),
     }
 
 
@@ -56,8 +48,7 @@ def load_saved_token() -> str:
     if os.path.exists(TOKEN_FILE):
         with open(TOKEN_FILE, encoding="utf-8") as f:
             t = f.read().strip()
-            if t:
-                return t
+            if t: return t
     return ""
 
 
@@ -72,9 +63,22 @@ def save_token(token: str) -> None:
 HA_API   = "http://supervisor/core/api"
 HA_TOKEN = os.environ.get("SUPERVISOR_TOKEN", "")
 
+# Estados válidos para HA: máx 255 chars, no pueden ser None
+def _safe_state(value: Any) -> str:
+    if value is None:
+        return "unknown"
+    s = str(value)
+    return s[:255] if len(s) > 255 else s
+
 
 def ha_set_state(entity_id: str, state: Any, attributes: dict | None = None) -> bool:
-    payload = json.dumps({"state": state, "attributes": attributes or {}}).encode("utf-8")
+    # Validar entity_id — solo letras, números, guiones bajos, punto
+    import re
+    if not re.match(r'^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$', entity_id):
+        log.debug("entity_id inválido ignorado: %s", entity_id)
+        return False
+    safe = _safe_state(state)
+    payload = json.dumps({"state": safe, "attributes": attributes or {}}).encode("utf-8")
     req = urllib.request.Request(
         f"{HA_API}/states/{entity_id}", data=payload, method="POST",
         headers={"Authorization": f"Bearer {HA_TOKEN}", "Content-Type": "application/json"},
@@ -91,7 +95,7 @@ class SuitchClient:
     def __init__(self, email: str, password: str, initial_token: str = "", insecure_ssl: bool = False):
         self._email    = email
         self._password = password
-        self._token    = initial_token  # authenticity_token (CSRF)
+        self._token    = initial_token
         self._ssl_ctx  = self._build_ssl_ctx(insecure_ssl)
         self._opener   = self._new_opener()
 
@@ -141,7 +145,6 @@ class SuitchClient:
         headers = self._base_headers()
         headers["Content-Type"] = "application/json"
         if self._token:
-            # Rails tambien acepta el CSRF token por cabecera.
             headers["X-CSRF-Token"] = self._token
         req = urllib.request.Request(url, data=payload, method="POST", headers=headers)
         try:
@@ -154,41 +157,23 @@ class SuitchClient:
             log.warning("[%s] → %s: %s", label, e.code, body[:300])
             return None
 
-    # ──────────────────────────── LOGIN ────────────────────────────
     def login(self) -> None:
-        # Cookie jar nuevo en cada (re)login para evitar sesiones zombie.
         self._opener = self._new_opener()
-
-        # 1) Capturar el token de verify (CSRF) y la cookie de sesion.
         token = self._fetch_verify_token()
         if not token:
-            raise RuntimeError(
-                "No se pudo obtener el token de /auth/v2/verify.json. "
-                "¿Cambió la API de suitch.network?"
-            )
+            raise RuntimeError("No se pudo obtener el token de /auth/v2/verify.json.")
 
-        # 2) Login con el token capturado (mismo payload que la web Vue).
         resp = self._post_json(
             f"{BASE_URL}/auth/v2/login.json",
-            {
-                "email": self._email,
-                "password": self._password,
-                "authenticity_token": token,
-                "utf8": "✓",
-            },
+            {"email": self._email, "password": self._password,
+             "authenticity_token": token, "utf8": "✓"},
             "login",
         )
-
         if resp is None:
-            raise RuntimeError(
-                "Login rechazado por el servidor. Revisa email/password.\n"
-                "El token de verify se capturó bien, así que el problema es credenciales o API."
-            )
+            raise RuntimeError("Login rechazado. Revisa email/password.")
         if isinstance(resp, dict) and (resp.get("errors") or resp.get("error")):
             raise RuntimeError(f"Login con error: {resp.get('errors') or resp.get('error')}")
 
-        # 3) Si el login devuelve un token rotado, lo usamos a partir de ahora
-        #    (la web hace lo mismo: JwtService.saveToken(user.token)).
         self._extract_token(resp)
         log.info("Login exitoso")
 
@@ -205,8 +190,7 @@ class SuitchClient:
         return token
 
     def _extract_token(self, resp: Any) -> None:
-        if not isinstance(resp, dict):
-            return
+        if not isinstance(resp, dict): return
         new_token = (
             resp.get("token") or resp.get("authenticity_token") or
             resp.get("id_token") or resp.get("jwt") or resp.get("access_token")
@@ -217,7 +201,6 @@ class SuitchClient:
             log.info("Token rotado tras login: %s…", str(new_token)[:16])
 
     def _ensure_logged_in_get(self, url: str, label: str) -> Any:
-        """GET que re-loguea automaticamente si la sesion expiro (401/403)."""
         try:
             return self._get_json(url, label)
         except urllib.error.HTTPError as e:
@@ -227,34 +210,26 @@ class SuitchClient:
                 return self._get_json(url, label)
             raise
 
-    # ──────────────────────────── DATOS ────────────────────────────
     def devices(self) -> list[dict]:
         data = self._ensure_logged_in_get(f"{BASE_URL}/devices/v2/show.json", "devices")
-        if isinstance(data, list):
-            return data
-        if isinstance(data, dict):
-            return data.get("devices", []) or []
+        if isinstance(data, list): return data
+        if isinstance(data, dict): return data.get("devices", []) or []
         return []
 
     def device_props(self, token: str) -> list[dict]:
-        """Lecturas reales de sensores: lista de {command, value, unit, ...}."""
         try:
             data = self._ensure_logged_in_get(
-                f"{BASE_URL}/devices/v2/{token}/props.json", f"props/{token}"
-            )
+                f"{BASE_URL}/devices/v2/{token}/props.json", f"props/{token}")
         except urllib.error.HTTPError:
             return []
-        if isinstance(data, list):
-            return data
-        if isinstance(data, dict):
-            return data.get("props", []) or []
+        if isinstance(data, list): return data
+        if isinstance(data, dict): return data.get("props", []) or []
         return []
 
     def device_battery(self, token: str) -> dict | None:
         try:
             data = self._ensure_logged_in_get(
-                f"{BASE_URL}/devices/v2/{token}/battery.json", f"battery/{token}"
-            )
+                f"{BASE_URL}/devices/v2/{token}/battery.json", f"battery/{token}")
         except urllib.error.HTTPError:
             return None
         return data if isinstance(data, dict) else None
@@ -262,14 +237,14 @@ class SuitchClient:
 
 def _unit_and_class(field: str, unit: str = ""):
     f = f"{field} {unit}".lower()
-    if any(x in f for x in ("hum", "humidity", "humedad")):  return (unit or "%"),  "humidity"
-    if any(x in f for x in ("temp", "temperatura", "°c")):   return (unit or "°C"), "temperature"
-    if any(x in f for x in ("volt", "voltage", "voltaje")):  return (unit or "V"),  "voltage"
-    if any(x in f for x in ("amp", "current", "corriente")): return (unit or "A"),  "current"
-    if any(x in f for x in ("batt", "bater")):               return (unit or "%"),  "battery"
-    if any(x in f for x in ("press", "presion", "hpa")):     return (unit or "hPa"),"pressure"
-    if any(x in f for x in ("lux", "illum", "luz")):         return (unit or "lx"), "illuminance"
-    if any(x in f for x in ("co2", "ppm")):                  return (unit or "ppm"),"carbon_dioxide"
+    if any(x in f for x in ("hum", "humidity", "humedad")):  return (unit or "%"),   "humidity"
+    if any(x in f for x in ("temp", "temperatura", "°c")):   return (unit or "°C"),  "temperature"
+    if any(x in f for x in ("volt", "voltage", "voltaje")):  return (unit or "V"),   "voltage"
+    if any(x in f for x in ("amp", "current", "corriente")): return (unit or "A"),   "current"
+    if any(x in f for x in ("batt", "bater")):               return (unit or "%"),   "battery"
+    if any(x in f for x in ("press", "presion", "hpa")):     return (unit or "hPa"), "pressure"
+    if any(x in f for x in ("lux", "illum", "luz")):         return (unit or "lx"),  "illuminance"
+    if any(x in f for x in ("co2", "ppm")):                  return (unit or "ppm"), "carbon_dioxide"
     return (unit or None), None
 
 
@@ -277,19 +252,28 @@ def _slug(s: str) -> str:
     return "".join(c if c.isalnum() else "_" for c in s.lower()).strip("_")
 
 
+# Campos del device object que NO son datos de sensor
+_SKIP_FIELDS = {
+    "token", "uid", "id", "object", "name", "label", "type", "device_type",
+    "rig_id", "rig_id_owner", "rig_is_public", "rig_likes", "rig_connection_type",
+    "created_at", "updated_at", "user_id", "firmware", "hardware", "description",
+}
+
+
 def publish_device(client: "SuitchClient", dev: dict) -> None:
-    token = str(dev.get("token") or dev.get("uid") or dev.get("id") or "unknown")
-    name  = dev.get("object") or dev.get("name") or dev.get("label") or token
-    slug  = _slug(str(name)) or _slug(token)
+    token     = str(dev.get("token") or dev.get("uid") or dev.get("id") or "unknown")
+    name      = dev.get("object") or dev.get("name") or dev.get("label") or token
+    # Incluir token corto en el slug para evitar colisiones entre dispositivos del mismo tipo
+    token_short = token[:8] if len(token) > 8 else token
+    slug      = f"{_slug(str(name))}_{token_short}" if _slug(str(name)) else _slug(token)
     published = False
 
-    # 1) Lecturas reales desde props.json (fuente principal de datos).
+    # 1) Props reales
     for prop in client.device_props(token):
         label = str(prop.get("command") or prop.get("name") or prop.get("label") or "value")
         value = prop.get("value")
         unit  = str(prop.get("unit") or "")
-        if value is None:
-            continue
+        if value is None: continue
         entity_id = f"sensor.suitch_{slug}_{_slug(label)}"
         u, dev_class = _unit_and_class(label, unit)
         attrs = {"friendly_name": f"Suitch {name} {label}", "device_token": token, "source": "suitch.network"}
@@ -297,24 +281,22 @@ def publish_device(client: "SuitchClient", dev: dict) -> None:
         if dev_class: attrs["device_class"] = dev_class
         ok = ha_set_state(entity_id, value, attrs)
         published = True
-        log.info("  %-48s = %s %s [%s]", entity_id, value, u or "", "OK" if ok else "FAIL")
+        log.info("  %-50s = %s %s [%s]", entity_id, value, u or "", "OK" if ok else "FAIL")
 
-    # 2) Bateria como entidad dedicada.
+    # 2) Batería
     batt = client.device_battery(token)
     if isinstance(batt, dict):
         level = batt.get("level") or batt.get("percentage") or batt.get("value")
         if level is not None:
-            ha_set_state(
-                f"sensor.suitch_{slug}_battery", level,
-                {"friendly_name": f"Suitch {name} Battery", "device_token": token,
-                 "unit_of_measurement": "%", "device_class": "battery", "source": "suitch.network"},
-            )
+            ha_set_state(f"sensor.suitch_{slug}_battery", level, {
+                "friendly_name": f"Suitch {name} Battery", "device_token": token,
+                "unit_of_measurement": "%", "device_class": "battery", "source": "suitch.network"})
             published = True
 
-    # 3) Campos numericos del propio device (fallback).
+    # 3) Campos numéricos del device (saltando campos de metadatos)
     for field, value in dev.items():
-        if not isinstance(value, (int, float)) or isinstance(value, bool):
-            continue
+        if field in _SKIP_FIELDS: continue
+        if not isinstance(value, (int, float)) or isinstance(value, bool): continue
         entity_id = f"sensor.suitch_{slug}_{_slug(field)}"
         u, dev_class = _unit_and_class(field)
         attrs = {"friendly_name": f"Suitch {name} {field}", "device_token": token, "source": "suitch.network"}
@@ -323,10 +305,10 @@ def publish_device(client: "SuitchClient", dev: dict) -> None:
         ha_set_state(entity_id, value, attrs)
         published = True
 
-    # 4) Si no hubo nada numerico, al menos un estado de presencia.
+    # 4) Estado de presencia si no hubo datos
     if not published:
         ha_set_state(f"sensor.suitch_{slug}_state", "online",
-                     {"friendly_name": f"Suitch {name}", "device_token": token, "raw": dev})
+                     {"friendly_name": f"Suitch {name}", "device_token": token, "raw": str(dev)[:255]})
 
 
 def main() -> None:
