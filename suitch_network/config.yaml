@@ -1,6 +1,6 @@
 name: "Suitch Network"
 description: "Integración con suitch.network — publica sensores vía HA REST API"
-version: "1.4.2"
+version: "1.5.0"
 slug: "suitch_network"
 init: false
 arch:
@@ -14,9 +14,11 @@ options:
   password: ""
   scan_interval: 60
   id_token: ""
+  insecure_ssl: false
 
 schema:
   email: str
   password: str
   scan_interval: int
   id_token: str
+  insecure_ssl: bool
