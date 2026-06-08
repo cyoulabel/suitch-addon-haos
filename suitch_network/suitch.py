@@ -259,6 +259,14 @@ _SKIP_FIELDS = {
     "created_at", "updated_at", "user_id", "firmware", "hardware", "description",
 }
 
+# Props que son metadata y no tienen sentido como sensores en HA
+_SKIP_PROPS = {
+    "id", "id_owner", "owner", "is_public", "public", "likes", "connection_type",
+    "connection", "created_at", "updated_at", "firmware", "hardware",
+    "rig_id", "rig_id_owner", "rig_is_public", "rig_likes", "rig_connection_type",
+    "token", "uid", "name", "label", "type", "description",
+}
+
 
 def publish_device(client: "SuitchClient", dev: dict) -> None:
     token     = str(dev.get("token") or dev.get("uid") or dev.get("id") or "unknown")
@@ -271,6 +279,8 @@ def publish_device(client: "SuitchClient", dev: dict) -> None:
     # 1) Props reales
     for prop in client.device_props(token):
         label = str(prop.get("command") or prop.get("name") or prop.get("label") or "value")
+        if label.lower() in _SKIP_PROPS:
+            continue
         value = prop.get("value")
         unit  = str(prop.get("unit") or "")
         if value is None: continue
