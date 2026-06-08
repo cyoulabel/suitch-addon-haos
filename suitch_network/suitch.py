@@ -226,6 +226,15 @@ class SuitchClient:
         if isinstance(data, dict): return data.get("props", []) or []
         return []
 
+    def device_data(self, token: str) -> Any:
+        """Lectura raw del sensor — devuelve el valor más reciente (ej. humedad = 11)."""
+        try:
+            data = self._ensure_logged_in_get(
+                f"{BASE_URL}/devices/v2/{token}/data.json", f"data/{token}")
+        except urllib.error.HTTPError:
+            return None
+        return data
+
     def device_battery(self, token: str) -> dict | None:
         try:
             data = self._ensure_logged_in_get(
@@ -275,6 +284,29 @@ def publish_device(client: "SuitchClient", dev: dict) -> None:
     token_short = token[:8] if len(token) > 8 else token
     slug      = f"{_slug(str(name))}_{token_short}" if _slug(str(name)) else _slug(token)
     published = False
+
+    # 0) Lectura raw (soil moisture y otros sensores de valor único)
+    raw = client.device_data(token)
+    if raw is not None:
+        # Puede ser un número directo, o dict con value/data, o lista
+        raw_val = None
+        if isinstance(raw, (int, float)):
+            raw_val = raw
+        elif isinstance(raw, dict):
+            raw_val = raw.get("value") or raw.get("data") or raw.get("reading")
+        elif isinstance(raw, list) and raw:
+            first = raw[0]
+            raw_val = first.get("value") if isinstance(first, dict) else first
+        if raw_val is not None:
+            entity_id = f"sensor.suitch_{slug}_value"
+            u, dev_class = _unit_and_class(name)
+            attrs = {"friendly_name": f"Suitch {name}", "device_token": token,
+                     "source": "suitch.network", "raw_response": str(raw)[:200]}
+            if u:         attrs["unit_of_measurement"] = u
+            if dev_class: attrs["device_class"] = dev_class
+            ok = ha_set_state(entity_id, raw_val, attrs)
+            published = True
+            log.info("  %-50s = %s [%s]", entity_id, raw_val, "OK" if ok else "FAIL")
 
     # 1) Props reales
     for prop in client.device_props(token):
