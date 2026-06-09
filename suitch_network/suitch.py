@@ -118,7 +118,7 @@ _SKIP_FIELDS = {
     "id_owner", "is_public", "likes", "connection_type",
     "created_at", "updated_at", "user_id", "firmware", "hardware", "description",
     "notify_email", "notify_twitter", "notify_fbinbox", "notify_telegram",
-    "fav",
+    "fav", "location", "bt_key",
 }
 _SKIP_PROPS = {
     "id", "id_owner", "owner", "is_public", "public", "likes", "connection_type",
@@ -126,7 +126,7 @@ _SKIP_PROPS = {
     "rig_id", "rig_id_owner", "rig_is_public", "rig_likes", "rig_connection_type",
     "token", "uid", "name", "label", "type", "description",
     "notify_email", "notify_twitter", "notify_fbinbox", "notify_telegram",
-    "fav",
+    "fav", "location", "bt_key",
 }
 
 # Campos XYZ que se deben separar en ejes
@@ -228,6 +228,7 @@ class MQTTPublisher:
         try:
             tmp.connect(self._host, self._port, keepalive=30)
             tmp.subscribe("homeassistant/sensor/suitch_+/config", qos=1)
+            tmp.subscribe("homeassistant/device_tracker/suitch_+/config", qos=1)
             tmp.loop_start()
             _time.sleep(2)          # esperar mensajes retenidos
             tmp.loop_stop()
@@ -414,7 +415,61 @@ def _pub_field(mqp: MQTTPublisher, token: str, name: str,
     mqp.pub(token, name, field_slug, value, u or unit or None, dc, icon)
 
 
-def publish_device(client: SuitchClient, mqp: MQTTPublisher, dev: dict) -> None:
+def _parse_location(value: str) -> dict | None:
+    """Decodifica base64 JSON de localización → {'lat':..., 'lon':..., 'conf':...}"""
+    import base64
+    try:
+        # El valor puede ser "base64== optionalkey" — tomar solo la primera parte
+        b64 = str(value).split()[0]
+        data = json.loads(base64.b64decode(b64 + "=="))
+        if "lat" in data and "lon" in data:
+            return data
+    except Exception:
+        pass
+    return None
+
+
+def pub_tracker(mqp: MQTTPublisher, token: str, name: str, loc: dict) -> None:
+    """Publica un device_tracker vía MQTT discovery."""
+    unique_id   = f"suitch_{token}_tracker"
+    state_topic = f"suitch/{token}/tracker/state"
+    attr_topic  = f"suitch/{token}/tracker/attributes"
+
+    config_payload = {
+        "name":              f"{name}",
+        "unique_id":         unique_id,
+        "state_topic":       state_topic,
+        "json_attributes_topic": attr_topic,
+        "icon":              "mdi:map-marker",
+        "payload_home":      "home",
+        "payload_not_home":  "not_home",
+        "source_type":       "gps",
+        "device": {
+            "identifiers":  [f"suitch_{token}"],
+            "name":         f"Suitch {name}",
+            "manufacturer": "Suitch",
+            "model":        "suitch.network",
+        },
+    }
+    config_topic = f"homeassistant/device_tracker/{unique_id}/config"
+    mqp.publish(config_topic, json.dumps(config_payload), retain=True)
+
+    # Estado: "not_home" por defecto (HA lo mueve a zona si coincide coords)
+    mqp.publish(state_topic, "not_home", retain=True)
+
+    # Atributos con lat/lon para el mapa
+    attrs = {
+        "latitude":  loc["lat"],
+        "longitude": loc["lon"],
+        "gps_accuracy": int(loc.get("conf", 50)),
+        "source_type": "gps",
+    }
+    mqp.publish(attr_topic, json.dumps(attrs), retain=True)
+    log.info("  TRACKER %-40s lat=%.4f lon=%.4f acc=%s",
+             f"suitch/{token}", loc["lat"], loc["lon"], loc.get("conf", "?"))
+
+
+
     token    = str(dev.get("token") or dev.get("uid") or dev.get("id") or "unknown")
     name     = str(dev.get("object") or dev.get("name") or dev.get("label") or token)
     dev_type = str(dev.get("type") or dev.get("device_type") or dev.get("object") or "")
@@ -434,7 +489,14 @@ def publish_device(client: SuitchClient, mqp: MQTTPublisher, dev: dict) -> None:
     # 2) Props reales
     for prop in client.device_props(token):
         label = str(prop.get("command") or prop.get("name") or prop.get("label") or "value")
-        if label.lower() in _SKIP_PROPS: continue
+        if label.lower() in _SKIP_PROPS:
+            # Publicar tracker si es location o bt_key
+            if label.lower() in ("location", "bt_key"):
+                loc = _parse_location(str(prop.get("value") or ""))
+                if loc:
+                    pub_tracker(mqp, token, name, loc)
+                    published = True
+            continue
         value = prop.get("value")
         unit  = str(prop.get("unit") or "")
         if value is None: continue
@@ -451,7 +513,14 @@ def publish_device(client: SuitchClient, mqp: MQTTPublisher, dev: dict) -> None:
 
     # 4) Campos numéricos del device object
     for field, value in dev.items():
-        if field in _SKIP_FIELDS: continue
+        if field in _SKIP_FIELDS:
+            # Publicar tracker si es location o bt_key
+            if field.lower() in ("location", "bt_key") and value:
+                loc = _parse_location(str(value))
+                if loc:
+                    pub_tracker(mqp, token, name, loc)
+                    published = True
+            continue
         if not isinstance(value, (int, float)) or isinstance(value, bool): continue
         _pub_field(mqp, token, name, field, value)
         published = True
