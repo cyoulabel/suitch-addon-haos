@@ -1,7 +1,7 @@
 FROM python:3.12-alpine
 
-# Evitar segfault de OpenSSL en Alpine
-RUN apk add --no-cache ca-certificates openssl libssl3 libcrypto3
+RUN apk add --no-cache ca-certificates openssl libssl3 libcrypto3 && \
+    pip install paho-mqtt --break-system-packages
 
 WORKDIR /app
 COPY run.sh /run.sh
