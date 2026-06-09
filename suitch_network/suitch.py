@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Suitch Network — Home Assistant Add-on
-Sin dependencias externas (stdlib pura).
+Publica sensores vía MQTT Discovery → aparecen como Devices en HA.
 """
 
 import json
@@ -15,6 +15,8 @@ import urllib.error
 import http.cookiejar
 from typing import Any
 
+import paho.mqtt.client as mqtt
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -24,9 +26,18 @@ log = logging.getLogger("suitch")
 
 BASE_URL   = "https://suitch.network"
 TOKEN_FILE = "/data/id_token.txt"
+DISC_PREFIX = "homeassistant"   # prefijo estándar de MQTT discovery
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
+SSL_CTX = ssl.create_default_context()
+SSL_CTX.check_hostname = False
+SSL_CTX.verify_mode    = ssl.CERT_NONE
+
+
+# ─────────────────────────────────────────────────────────────
+#  Config
+# ─────────────────────────────────────────────────────────────
 
 def load_config() -> dict:
     with open("/data/options.json", encoding="utf-8") as f:
@@ -36,11 +47,15 @@ def load_config() -> dict:
     if not email or not password:
         raise ValueError("Email o password vacíos — revisa Configuration.")
     return {
-        "email":        email,
-        "password":     password,
+        "email":         email,
+        "password":      password,
         "scan_interval": int(opts.get("scan_interval", 60)),
-        "id_token":     opts.get("id_token", "").strip(),
-        "insecure_ssl": bool(opts.get("insecure_ssl", False)),
+        "id_token":      opts.get("id_token", "").strip(),
+        "insecure_ssl":  bool(opts.get("insecure_ssl", False)),
+        "mqtt_host":     opts.get("mqtt_host", "core-mosquitto"),
+        "mqtt_port":     int(opts.get("mqtt_port", 1883)),
+        "mqtt_user":     opts.get("mqtt_user", ""),
+        "mqtt_password": opts.get("mqtt_password", ""),
     }
 
 
@@ -60,36 +75,77 @@ def save_token(token: str) -> None:
         log.warning("No se pudo guardar el token: %s", e)
 
 
-HA_API   = "http://supervisor/core/api"
-HA_TOKEN = os.environ.get("SUPERVISOR_TOKEN", "")
+# ─────────────────────────────────────────────────────────────
+#  MQTT
+# ─────────────────────────────────────────────────────────────
 
-# Estados válidos para HA: máx 255 chars, no pueden ser None
-def _safe_state(value: Any) -> str:
-    if value is None:
-        return "unknown"
-    s = str(value)
-    return s[:255] if len(s) > 255 else s
+class MQTTPublisher:
+    def __init__(self, host: str, port: int, user: str, password: str):
+        self._host     = host
+        self._port     = port
+        self._user     = user
+        self._password = password
+        self._client   = None
+        self._connect()
+
+    def _connect(self) -> None:
+        c = mqtt.Client(client_id="suitch_addon", protocol=mqtt.MQTTv311)
+        if self._user:
+            c.username_pw_set(self._user, self._password)
+        c.on_connect = lambda cl, ud, fl, rc: log.info("MQTT conectado (rc=%s)", rc)
+        c.on_disconnect = lambda cl, ud, rc: log.warning("MQTT desconectado (rc=%s)", rc)
+        try:
+            c.connect(self._host, self._port, keepalive=60)
+            c.loop_start()
+            time.sleep(1)
+            self._client = c
+            log.info("MQTT → %s:%s", self._host, self._port)
+        except Exception as e:
+            log.error("No se pudo conectar a MQTT: %s", e)
+            self._client = None
+
+    def publish(self, topic: str, payload: str, retain: bool = False) -> None:
+        if self._client is None:
+            self._connect()
+        if self._client:
+            self._client.publish(topic, payload, qos=1, retain=retain)
+
+    def announce(self, device_token: str, device_name: str, field: str,
+                 unit: str | None, device_class: str | None) -> str:
+        """Publica config de MQTT discovery. Devuelve el state_topic."""
+        unique_id   = f"suitch_{device_token}_{field}"
+        state_topic = f"suitch/{device_token}/{field}/state"
+
+        payload = {
+            "name":         f"{device_name} {field}".strip(),
+            "unique_id":    unique_id,
+            "state_topic":  state_topic,
+            "device": {
+                "identifiers": [f"suitch_{device_token}"],
+                "name":        f"Suitch {device_name}",
+                "manufacturer": "Suitch",
+                "model":       "suitch.network",
+                "via_device":  "suitch_addon",
+            },
+        }
+        if unit:        payload["unit_of_measurement"] = unit
+        if device_class: payload["device_class"]       = device_class
+
+        config_topic = f"{DISC_PREFIX}/sensor/{unique_id}/config"
+        self.publish(config_topic, json.dumps(payload), retain=True)
+        return state_topic
+
+    def publish_state(self, device_token: str, device_name: str, field: str,
+                      value: Any, unit: str | None = None,
+                      device_class: str | None = None) -> None:
+        state_topic = self.announce(device_token, device_name, field, unit, device_class)
+        self.publish(state_topic, str(value))
+        log.info("  MQTT %-45s = %s %s", state_topic, value, unit or "")
 
 
-def ha_set_state(entity_id: str, state: Any, attributes: dict | None = None) -> bool:
-    # Validar entity_id — solo letras, números, guiones bajos, punto
-    import re
-    if not re.match(r'^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$', entity_id):
-        log.debug("entity_id inválido ignorado: %s", entity_id)
-        return False
-    safe = _safe_state(state)
-    payload = json.dumps({"state": safe, "attributes": attributes or {}}).encode("utf-8")
-    req = urllib.request.Request(
-        f"{HA_API}/states/{entity_id}", data=payload, method="POST",
-        headers={"Authorization": f"Bearer {HA_TOKEN}", "Content-Type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as r:
-            return r.status in (200, 201)
-    except Exception as e:
-        log.error("HA API error [%s]: %s", entity_id, e)
-        return False
-
+# ─────────────────────────────────────────────────────────────
+#  Cliente suitch.network
+# ─────────────────────────────────────────────────────────────
 
 class SuitchClient:
     def __init__(self, email: str, password: str, initial_token: str = "", insecure_ssl: bool = False):
@@ -123,11 +179,8 @@ class SuitchClient:
         return raw
 
     def _base_headers(self) -> dict:
-        return {
-            "User-Agent": UA,
-            "Accept": "application/json",
-            "X-Requested-With": "XMLHttpRequest",
-        }
+        return {"User-Agent": UA, "Accept": "application/json",
+                "X-Requested-With": "XMLHttpRequest"}
 
     def _get_json(self, url: str, label: str) -> Any:
         req = urllib.request.Request(url, headers=self._base_headers())
@@ -137,13 +190,12 @@ class SuitchClient:
                 return json.loads(body) if body else None
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")
-            log.warning("[GET %s] → %s: %s", label, e.code, body[:300])
+            log.warning("[GET %s] → %s: %s", label, e.code, body[:200])
             raise
 
     def _post_json(self, url: str, data: dict, label: str) -> Any:
         payload = json.dumps(data).encode("utf-8")
-        headers = self._base_headers()
-        headers["Content-Type"] = "application/json"
+        headers = {**self._base_headers(), "Content-Type": "application/json"}
         if self._token:
             headers["X-CSRF-Token"] = self._token
         req = urllib.request.Request(url, data=payload, method="POST", headers=headers)
@@ -154,14 +206,21 @@ class SuitchClient:
                 return json.loads(body) if body else None
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")
-            log.warning("[%s] → %s: %s", label, e.code, body[:300])
+            log.warning("[%s] → %s: %s", label, e.code, body[:200])
             return None
 
     def login(self) -> None:
         self._opener = self._new_opener()
-        token = self._fetch_verify_token()
+        log.info("GET /auth/v2/verify.json (capturando token CSRF)")
+        data = self._get_json(f"{BASE_URL}/auth/v2/verify.json", "verify")
+        token = ""
+        if isinstance(data, dict):
+            token = data.get("token") or data.get("authenticity_token") or ""
         if not token:
-            raise RuntimeError("No se pudo obtener el token de /auth/v2/verify.json.")
+            raise RuntimeError("No se pudo obtener token de /auth/v2/verify.json")
+        self._token = token
+        save_token(token)
+        log.info("Token de verify capturado: %s…", token[:16])
 
         resp = self._post_json(
             f"{BASE_URL}/auth/v2/login.json",
@@ -169,38 +228,17 @@ class SuitchClient:
              "authenticity_token": token, "utf8": "✓"},
             "login",
         )
-        if resp is None:
-            raise RuntimeError("Login rechazado. Revisa email/password.")
-        if isinstance(resp, dict) and (resp.get("errors") or resp.get("error")):
-            raise RuntimeError(f"Login con error: {resp.get('errors') or resp.get('error')}")
-
-        self._extract_token(resp)
+        if resp is None or (isinstance(resp, dict) and (resp.get("errors") or resp.get("error"))):
+            raise RuntimeError(f"Login rechazado: {resp}")
+        if isinstance(resp, dict):
+            new_token = resp.get("token") or resp.get("authenticity_token") or resp.get("id_token")
+            if new_token and new_token != self._token:
+                self._token = new_token
+                save_token(new_token)
+                log.info("Token rotado tras login: %s…", str(new_token)[:16])
         log.info("Login exitoso")
 
-    def _fetch_verify_token(self) -> str:
-        log.info("GET /auth/v2/verify.json (capturando token CSRF)")
-        data = self._get_json(f"{BASE_URL}/auth/v2/verify.json", "verify")
-        token = ""
-        if isinstance(data, dict):
-            token = data.get("token") or data.get("authenticity_token") or ""
-        if token:
-            self._token = token
-            save_token(token)
-            log.info("Token de verify capturado: %s…", token[:16])
-        return token
-
-    def _extract_token(self, resp: Any) -> None:
-        if not isinstance(resp, dict): return
-        new_token = (
-            resp.get("token") or resp.get("authenticity_token") or
-            resp.get("id_token") or resp.get("jwt") or resp.get("access_token")
-        )
-        if new_token and new_token != self._token:
-            self._token = new_token
-            save_token(new_token)
-            log.info("Token rotado tras login: %s…", str(new_token)[:16])
-
-    def _ensure_logged_in_get(self, url: str, label: str) -> Any:
+    def _ensure_get(self, url: str, label: str) -> Any:
         try:
             return self._get_json(url, label)
         except urllib.error.HTTPError as e:
@@ -211,14 +249,14 @@ class SuitchClient:
             raise
 
     def devices(self) -> list[dict]:
-        data = self._ensure_logged_in_get(f"{BASE_URL}/devices/v2/show.json", "devices")
+        data = self._ensure_get(f"{BASE_URL}/devices/v2/show.json", "devices")
         if isinstance(data, list): return data
         if isinstance(data, dict): return data.get("devices", []) or []
         return []
 
     def device_props(self, token: str) -> list[dict]:
         try:
-            data = self._ensure_logged_in_get(
+            data = self._ensure_get(
                 f"{BASE_URL}/devices/v2/{token}/props.json", f"props/{token}")
         except urllib.error.HTTPError:
             return []
@@ -226,43 +264,44 @@ class SuitchClient:
         if isinstance(data, dict): return data.get("props", []) or []
         return []
 
-    def device_data(self, token: str, device_type: str = "") -> Any:
-        """Lectura raw del sensor — solo para dispositivos tipo soil."""
-        if "soil" not in device_type.lower():
-            return None   # Solo aplica a sensores de suelo
+    def device_battery(self, token: str) -> dict | None:
+        try:
+            data = self._ensure_get(
+                f"{BASE_URL}/devices/v2/{token}/battery.json", f"battery/{token}")
+        except urllib.error.HTTPError:
+            return None
+        return data if isinstance(data, dict) else None
 
-        candidates = [
+    def device_soil(self, token: str) -> Any:
+        for url in [
             f"{BASE_URL}/devices/v2/findmy/{token}/soil.json",
             f"{BASE_URL}/devices/v2/{token}/soil.json",
-        ]
-        for url in candidates:
+        ]:
             try:
-                data = self._get_json(url, f"data/{token}")
+                data = self._get_json(url, f"soil/{token}")
                 if data is not None:
                     return data
             except urllib.error.HTTPError:
                 pass
         return None
 
-    def device_battery(self, token: str) -> dict | None:
-        try:
-            data = self._ensure_logged_in_get(
-                f"{BASE_URL}/devices/v2/{token}/battery.json", f"battery/{token}")
-        except urllib.error.HTTPError:
-            return None
-        return data if isinstance(data, dict) else None
 
+# ─────────────────────────────────────────────────────────────
+#  Helpers
+# ─────────────────────────────────────────────────────────────
 
 def _unit_and_class(field: str, unit: str = ""):
     f = f"{field} {unit}".lower()
-    if any(x in f for x in ("hum", "humidity", "humedad")):  return (unit or "%"),   "humidity"
-    if any(x in f for x in ("temp", "temperatura", "°c")):   return (unit or "°C"),  "temperature"
-    if any(x in f for x in ("volt", "voltage", "voltaje")):  return (unit or "V"),   "voltage"
-    if any(x in f for x in ("amp", "current", "corriente")): return (unit or "A"),   "current"
-    if any(x in f for x in ("batt", "bater")):               return (unit or "%"),   "battery"
-    if any(x in f for x in ("press", "presion", "hpa")):     return (unit or "hPa"), "pressure"
-    if any(x in f for x in ("lux", "illum", "luz")):         return (unit or "lx"),  "illuminance"
-    if any(x in f for x in ("co2", "ppm")):                  return (unit or "ppm"), "carbon_dioxide"
+    if any(x in f for x in ("hum", "humidity", "humedad", "moisture")):
+        return (unit or "%"),   "humidity"
+    if any(x in f for x in ("temp", "temperatura", "°c")):
+        return (unit or "°C"),  "temperature"
+    if any(x in f for x in ("volt", "voltage")):   return (unit or "V"),   "voltage"
+    if any(x in f for x in ("amp", "current")):    return (unit or "A"),   "current"
+    if any(x in f for x in ("batt", "bater")):     return (unit or "%"),   "battery"
+    if any(x in f for x in ("press", "hpa")):      return (unit or "hPa"), "pressure"
+    if any(x in f for x in ("lux", "illum")):      return (unit or "lx"),  "illuminance"
+    if any(x in f for x in ("co2", "ppm")):        return (unit or "ppm"), "carbon_dioxide"
     return (unit or None), None
 
 
@@ -270,15 +309,12 @@ def _slug(s: str) -> str:
     return "".join(c if c.isalnum() else "_" for c in s.lower()).strip("_")
 
 
-# Campos del device object que NO son datos de sensor
 _SKIP_FIELDS = {
     "token", "uid", "id", "object", "name", "label", "type", "device_type",
     "rig_id", "rig_id_owner", "rig_is_public", "rig_likes", "rig_connection_type",
     "id_owner", "is_public", "likes", "connection_type",
     "created_at", "updated_at", "user_id", "firmware", "hardware", "description",
 }
-
-# Props que son metadata y no tienen sentido como sensores en HA
 _SKIP_PROPS = {
     "id", "id_owner", "owner", "is_public", "public", "likes", "connection_type",
     "connection", "created_at", "updated_at", "firmware", "hardware",
@@ -287,82 +323,60 @@ _SKIP_PROPS = {
 }
 
 
-def publish_device(client: "SuitchClient", dev: dict) -> None:
-    token     = str(dev.get("token") or dev.get("uid") or dev.get("id") or "unknown")
-    name      = dev.get("object") or dev.get("name") or dev.get("label") or token
-    dev_type  = str(dev.get("type") or dev.get("device_type") or dev.get("object") or "")
-    # Incluir token corto en el slug para evitar colisiones entre dispositivos del mismo tipo
-    token_short = token[:8] if len(token) > 8 else token
-    slug      = f"{_slug(str(name))}_{token_short}" if _slug(str(name)) else _slug(token)
+def publish_device(client: SuitchClient, mqp: MQTTPublisher, dev: dict) -> None:
+    token    = str(dev.get("token") or dev.get("uid") or dev.get("id") or "unknown")
+    name     = dev.get("object") or dev.get("name") or dev.get("label") or token
+    dev_type = str(dev.get("type") or dev.get("device_type") or dev.get("object") or "")
     published = False
 
-    # 0) Lectura raw (soil moisture y otros sensores de valor único)
-    raw = client.device_data(token, dev_type)
-    if raw is not None:
-        # Puede ser un número directo, o dict con value/data, o lista
-        raw_val = None
-        if isinstance(raw, (int, float)):
-            raw_val = raw
-        elif isinstance(raw, dict):
-            raw_val = raw.get("value") or raw.get("data") or raw.get("reading")
-        elif isinstance(raw, list) and raw:
-            first = raw[0]
-            raw_val = first.get("value") if isinstance(first, dict) else first
-        if raw_val is not None:
-            entity_id = f"sensor.suitch_{slug}_value"
-            u, dev_class = _unit_and_class(name)
-            attrs = {"friendly_name": f"Suitch {name}", "device_token": token,
-                     "source": "suitch.network", "raw_response": str(raw)[:200]}
-            if u:         attrs["unit_of_measurement"] = u
-            if dev_class: attrs["device_class"] = dev_class
-            ok = ha_set_state(entity_id, raw_val, attrs)
-            published = True
-            log.info("  %-50s = %s [%s]", entity_id, raw_val, "OK" if ok else "FAIL")
+    # 1) Soil moisture
+    if "soil" in dev_type.lower():
+        raw = client.device_soil(token)
+        if raw is not None:
+            val = raw if isinstance(raw, (int, float)) else (
+                raw.get("value") if isinstance(raw, dict) else
+                (raw[0].get("value") if isinstance(raw, list) and raw else None)
+            )
+            if val is not None:
+                mqp.publish_state(token, str(name), "moisture", val, None, None)
+                published = True
 
-    # 1) Props reales
+    # 2) Props reales
     for prop in client.device_props(token):
         label = str(prop.get("command") or prop.get("name") or prop.get("label") or "value")
         if label.lower() in _SKIP_PROPS:
             continue
         value = prop.get("value")
         unit  = str(prop.get("unit") or "")
-        if value is None: continue
-        entity_id = f"sensor.suitch_{slug}_{_slug(label)}"
+        if value is None:
+            continue
         u, dev_class = _unit_and_class(label, unit)
-        attrs = {"friendly_name": f"Suitch {name} {label}", "device_token": token, "source": "suitch.network"}
-        if u:         attrs["unit_of_measurement"] = u
-        if dev_class: attrs["device_class"] = dev_class
-        ok = ha_set_state(entity_id, value, attrs)
+        mqp.publish_state(token, str(name), _slug(label), value, u, dev_class)
         published = True
-        log.info("  %-50s = %s %s [%s]", entity_id, value, u or "", "OK" if ok else "FAIL")
 
-    # 2) Batería
+    # 3) Batería
     batt = client.device_battery(token)
     if isinstance(batt, dict):
         level = batt.get("level") or batt.get("percentage") or batt.get("value")
         if level is not None:
-            ha_set_state(f"sensor.suitch_{slug}_battery", level, {
-                "friendly_name": f"Suitch {name} Battery", "device_token": token,
-                "unit_of_measurement": "%", "device_class": "battery", "source": "suitch.network"})
+            mqp.publish_state(token, str(name), "battery", level, "%", "battery")
             published = True
 
-    # 3) Campos numéricos del device (saltando campos de metadatos)
+    # 4) Campos numéricos del device object
     for field, value in dev.items():
         if field in _SKIP_FIELDS: continue
         if not isinstance(value, (int, float)) or isinstance(value, bool): continue
-        entity_id = f"sensor.suitch_{slug}_{_slug(field)}"
         u, dev_class = _unit_and_class(field)
-        attrs = {"friendly_name": f"Suitch {name} {field}", "device_token": token, "source": "suitch.network"}
-        if u:         attrs["unit_of_measurement"] = u
-        if dev_class: attrs["device_class"] = dev_class
-        ha_set_state(entity_id, value, attrs)
+        mqp.publish_state(token, str(name), _slug(field), value, u, dev_class)
         published = True
 
-    # 4) Estado de presencia si no hubo datos
     if not published:
-        ha_set_state(f"sensor.suitch_{slug}_state", "online",
-                     {"friendly_name": f"Suitch {name}", "device_token": token, "raw": str(dev)[:255]})
+        mqp.publish_state(token, str(name), "state", "online")
 
+
+# ─────────────────────────────────────────────────────────────
+#  Main
+# ─────────────────────────────────────────────────────────────
 
 def main() -> None:
     cfg   = load_config()
@@ -370,6 +384,11 @@ def main() -> None:
 
     client   = SuitchClient(cfg["email"], cfg["password"], token, cfg["insecure_ssl"])
     interval = cfg["scan_interval"]
+
+    mqp = MQTTPublisher(
+        cfg["mqtt_host"], cfg["mqtt_port"],
+        cfg["mqtt_user"], cfg["mqtt_password"],
+    )
 
     log.info("Addon arrancado — polling cada %ds", interval)
     client.login()
@@ -379,7 +398,7 @@ def main() -> None:
             devs = client.devices()
             log.info("── %d dispositivo(s) ──", len(devs))
             for dev in devs:
-                publish_device(client, dev)
+                publish_device(client, mqp, dev)
         except Exception as e:
             log.warning("Error polling (%s) — re-login…", e)
             try:
