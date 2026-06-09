@@ -1,6 +1,6 @@
 name: "Suitch Network"
 description: "Integración con suitch.network — publica sensores vía MQTT discovery"
-version: "1.6.2"
+version: "1.6.3"
 slug: "suitch_network"
 init: false
 arch:
