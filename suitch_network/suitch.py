@@ -227,24 +227,21 @@ class SuitchClient:
         return []
 
     def device_data(self, token: str, device_type: str = "") -> Any:
-        """Lectura raw del sensor. Prueba endpoints según tipo de dispositivo."""
-        # Endpoints a probar según tipo
-        candidates = []
-        if "soil" in device_type.lower():
-            candidates = [
-                f"{BASE_URL}/devices/v2/findmy/{token}/soil.json",
-                f"{BASE_URL}/devices/v2/{token}/soil.json",
-            ]
-        else:
-            candidates = [f"{BASE_URL}/devices/v2/{token}/data.json"]
+        """Lectura raw del sensor — solo para dispositivos tipo soil."""
+        if "soil" not in device_type.lower():
+            return None   # Solo aplica a sensores de suelo
 
+        candidates = [
+            f"{BASE_URL}/devices/v2/findmy/{token}/soil.json",
+            f"{BASE_URL}/devices/v2/{token}/soil.json",
+        ]
         for url in candidates:
             try:
                 data = self._get_json(url, f"data/{token}")
                 if data is not None:
                     return data
             except urllib.error.HTTPError:
-                pass   # 403/404 = endpoint no aplica, probar siguiente
+                pass
         return None
 
     def device_battery(self, token: str) -> dict | None:
@@ -277,6 +274,7 @@ def _slug(s: str) -> str:
 _SKIP_FIELDS = {
     "token", "uid", "id", "object", "name", "label", "type", "device_type",
     "rig_id", "rig_id_owner", "rig_is_public", "rig_likes", "rig_connection_type",
+    "id_owner", "is_public", "likes", "connection_type",
     "created_at", "updated_at", "user_id", "firmware", "hardware", "description",
 }
 
