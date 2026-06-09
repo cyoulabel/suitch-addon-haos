@@ -226,14 +226,26 @@ class SuitchClient:
         if isinstance(data, dict): return data.get("props", []) or []
         return []
 
-    def device_data(self, token: str) -> Any:
-        """Lectura raw del sensor — devuelve el valor más reciente (ej. humedad = 11)."""
-        try:
-            data = self._ensure_logged_in_get(
-                f"{BASE_URL}/devices/v2/{token}/data.json", f"data/{token}")
-        except urllib.error.HTTPError:
-            return None
-        return data
+    def device_data(self, token: str, device_type: str = "") -> Any:
+        """Lectura raw del sensor. Prueba endpoints según tipo de dispositivo."""
+        # Endpoints a probar según tipo
+        candidates = []
+        if "soil" in device_type.lower():
+            candidates = [
+                f"{BASE_URL}/devices/v2/findmy/{token}/soil.json",
+                f"{BASE_URL}/devices/v2/{token}/soil.json",
+            ]
+        else:
+            candidates = [f"{BASE_URL}/devices/v2/{token}/data.json"]
+
+        for url in candidates:
+            try:
+                data = self._get_json(url, f"data/{token}")
+                if data is not None:
+                    return data
+            except urllib.error.HTTPError:
+                pass   # 403/404 = endpoint no aplica, probar siguiente
+        return None
 
     def device_battery(self, token: str) -> dict | None:
         try:
@@ -280,13 +292,14 @@ _SKIP_PROPS = {
 def publish_device(client: "SuitchClient", dev: dict) -> None:
     token     = str(dev.get("token") or dev.get("uid") or dev.get("id") or "unknown")
     name      = dev.get("object") or dev.get("name") or dev.get("label") or token
+    dev_type  = str(dev.get("type") or dev.get("device_type") or dev.get("object") or "")
     # Incluir token corto en el slug para evitar colisiones entre dispositivos del mismo tipo
     token_short = token[:8] if len(token) > 8 else token
     slug      = f"{_slug(str(name))}_{token_short}" if _slug(str(name)) else _slug(token)
     published = False
 
     # 0) Lectura raw (soil moisture y otros sensores de valor único)
-    raw = client.device_data(token)
+    raw = client.device_data(token, dev_type)
     if raw is not None:
         # Puede ser un número directo, o dict con value/data, o lista
         raw_val = None
