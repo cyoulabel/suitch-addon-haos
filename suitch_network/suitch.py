@@ -211,6 +211,35 @@ class MQTTPublisher:
         self.publish(config_topic, json.dumps(payload), retain=True)
         return state_topic
 
+    def purge_all(self) -> None:
+        """Borra todos los dispositivos Suitch del broker publicando payload vacío con retain."""
+        import time as _time
+        log.info("Limpiando dispositivos Suitch anteriores del broker MQTT…")
+        # Suscribirse temporalmente a homeassistant/sensor/suitch_*/config
+        found = []
+        def _on_msg(cl, ud, msg):
+            if msg.payload:
+                found.append(msg.topic)
+
+        tmp = mqtt.Client(client_id="suitch_purge", protocol=mqtt.MQTTv311)
+        if self._user:
+            tmp.username_pw_set(self._user, self._password)
+        tmp.on_message = _on_msg
+        try:
+            tmp.connect(self._host, self._port, keepalive=30)
+            tmp.subscribe("homeassistant/sensor/suitch_+/config", qos=1)
+            tmp.loop_start()
+            _time.sleep(2)          # esperar mensajes retenidos
+            tmp.loop_stop()
+            tmp.disconnect()
+        except Exception as e:
+            log.warning("Purge: no se pudo conectar temporal: %s", e)
+            return
+
+        for topic in found:
+            self.publish(topic, "", retain=True)
+        log.info("Purge: %d entidades eliminadas del broker", len(found))
+
     def pub(self, device_token: str, device_name: str, field: str,
             value: Any, unit: str | None = None,
             device_class: str | None = None,
@@ -444,6 +473,7 @@ def main() -> None:
                            cfg["mqtt_user"], cfg["mqtt_password"])
 
     log.info("Addon arrancado — polling cada %ds", cfg["scan_interval"])
+    mqp.purge_all()   # limpia entidades anteriores del broker
     client.login()
 
     while True:
